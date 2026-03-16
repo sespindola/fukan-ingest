@@ -17,21 +17,22 @@ func (c *Client) InsertBatch(ctx context.Context, events []model.FukanEvent) err
 	}
 
 	var (
-		colTimestamp proto.ColDateTime
-		colAssetID  proto.ColStr
-		colType     proto.ColStr
-		colLat      proto.ColInt32
-		colLon      proto.ColInt32
-		colAlt      proto.ColInt32
-		colSpeed    proto.ColFloat32
-		colHeading  proto.ColFloat32
-		colH3       proto.ColUInt64
-		colSource   proto.ColStr
-		colMeta     proto.ColStr
+		colEventTime proto.ColDateTime64
+		colAssetID   proto.ColStr
+		colType      proto.ColStr
+		colLat       proto.ColInt32
+		colLon       proto.ColInt32
+		colAlt       proto.ColInt32
+		colSpeed     proto.ColFloat32
+		colHeading   proto.ColFloat32
+		colH3        proto.ColUInt64
+		colSource    proto.ColStr
+		colMeta      proto.ColStr
 	)
+	colEventTime.Precision = 3 // milliseconds, matches DateTime64(3) in schema
 
 	for _, e := range events {
-		colTimestamp.Append(time.Unix(e.Timestamp/1000, 0))
+		colEventTime.Append(time.UnixMilli(e.Timestamp))
 		colAssetID.Append(e.AssetID)
 		colType.Append(string(e.AssetType))
 		colLat.Append(e.Lat)
@@ -45,7 +46,7 @@ func (c *Client) InsertBatch(ctx context.Context, events []model.FukanEvent) err
 	}
 
 	input := proto.Input{
-		{Name: "timestamp", Data: &colTimestamp},
+		{Name: "event_time", Data: &colEventTime},
 		{Name: "asset_id", Data: &colAssetID},
 		{Name: "asset_type", Data: proto.NewLowCardinality(&colType)},
 		{Name: "lat", Data: &colLat},
@@ -59,7 +60,7 @@ func (c *Client) InsertBatch(ctx context.Context, events []model.FukanEvent) err
 	}
 
     err := c.conn.Do(ctx, ch.Query{
-        Body:  "INSERT INTO fukan.telemetry_raw (timestamp, asset_id, asset_type, lat, lon, alt, speed, heading, h3_cell, source, metadata) VALUES",
+        Body:  "INSERT INTO fukan.telemetry_raw (event_time, asset_id, asset_type, lat, lon, alt, speed, heading, h3_cell, source, metadata) VALUES",
         Input: input,
     })
 	if err != nil {
