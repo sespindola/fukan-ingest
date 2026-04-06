@@ -1,5 +1,7 @@
 package config
 
+import "errors"
+
 // Config is the top-level configuration for fukan-ingest.
 type Config struct {
 	NATS         NATSConfig                     `mapstructure:"nats"`
@@ -38,4 +40,21 @@ type IntegrationConfig struct {
 	ClientID     string `mapstructure:"client_id"`
 	ClientSecret string `mapstructure:"client_secret"`
 	TokenURL     string `mapstructure:"token_url"`
+}
+
+// Validate checks that required configuration fields are present.
+func (c *Config) Validate() error {
+	if c.NATS.URL == "" {
+		return errors.New("config: nats.url is required")
+	}
+	if c.ClickHouse.Addr == "" {
+		return errors.New("config: clickhouse.addr is required")
+	}
+	if c.ClickHouse.Database == "" {
+		return errors.New("config: clickhouse.database is required")
+	}
+	if c.Redis.URL == "" {
+		return errors.New("config: redis.url is required")
+	}
+	return nil
 }

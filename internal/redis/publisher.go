@@ -25,8 +25,8 @@ func NewPublisher(url string) (*Publisher, error) {
 }
 
 // PublishBatch publishes events grouped by H3 cell using a pipeline.
-// Failures are non-fatal — logged but not returned as errors.
-func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent) {
+// Per-event marshal failures are logged and skipped; pipeline exec errors are returned.
+func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent) error {
 	pipe := p.client.Pipeline()
 	for _, e := range events {
 		channel := fmt.Sprintf("telemetry:%d", e.H3Cell)
@@ -38,8 +38,9 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent)
 		pipe.Publish(ctx, channel, data)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		slog.Warn("redis pipeline exec failed", "err", err)
+		return fmt.Errorf("redis pipeline exec: %w", err)
 	}
+	return nil
 }
 
 // Close closes the Redis connection.

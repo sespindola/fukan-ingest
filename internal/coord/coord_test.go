@@ -40,19 +40,28 @@ func TestScaleLon(t *testing.T) {
 }
 
 func TestComputeH3(t *testing.T) {
-	h3cell := ComputeH3(51.5074, -0.1278)
+	h3cell, err := ComputeH3(51.5074, -0.1278)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if h3cell == 0 {
 		t.Fatal("expected non-zero H3 cell")
 	}
 
 	// Same coordinates should produce same cell.
-	h3cell2 := ComputeH3(51.5074, -0.1278)
+	h3cell2, err := ComputeH3(51.5074, -0.1278)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if h3cell != h3cell2 {
 		t.Fatal("expected deterministic H3 cell")
 	}
 
 	// Different coordinates should produce different cell.
-	h3cell3 := ComputeH3(-33.8688, 151.2093)
+	h3cell3, err := ComputeH3(-33.8688, 151.2093)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if h3cell == h3cell3 {
 		t.Fatal("expected different H3 cell for different coordinates")
 	}

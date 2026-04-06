@@ -1,6 +1,7 @@
-package main
+package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -10,25 +11,45 @@ import (
 	"github.com/spf13/viper"
 )
 
-var (
-	cfgFile string
-	cfg     config.Config
-)
+type cfgKey struct{}
 
-var rootCmd = &cobra.Command{
-	Use:   "fukan-ingest",
-	Short: "Fukan data ingestion pipeline",
-	Long:  "Unified CLI for fukan-ingest workers and batchers.",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		return initConfig()
-	},
+// Execute builds and runs the root command.
+func Execute() error {
+	return newRoot().Execute()
 }
 
-func init() {
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ./config.yaml)")
+func newRoot() *cobra.Command {
+	var cfgFile string
+
+	root := &cobra.Command{
+		Use:   "fukan-ingest",
+		Short: "Fukan data ingestion pipeline",
+		Long:  "Unified CLI for fukan-ingest workers and batchers.",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgFile)
+			if err != nil {
+				return err
+			}
+			cmd.SetContext(context.WithValue(cmd.Context(), cfgKey{}, cfg))
+			return nil
+		},
+	}
+	root.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ./config.yaml)")
+
+	root.AddCommand(newWorkerCmd())
+	root.AddCommand(newBatcherCmd())
+	root.AddCommand(newRefreshCmd())
+	root.AddCommand(newMigrateCmd())
+	root.AddCommand(newVersionCmd())
+
+	return root
 }
 
-func initConfig() error {
+func configFrom(cmd *cobra.Command) *config.Config {
+	return cmd.Context().Value(cfgKey{}).(*config.Config)
+}
+
+func loadConfig(cfgFile string) (*config.Config, error) {
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)
 	} else {
@@ -69,17 +90,21 @@ func initConfig() error {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			// Only fail if a config file was explicitly specified.
 			if cfgFile != "" {
-				return fmt.Errorf("read config: %w", err)
+				return nil, fmt.Errorf("read config: %w", err)
 			}
 			// For path-not-found with no explicit file, also ignore.
 			if !os.IsNotExist(err) {
-				return fmt.Errorf("read config: %w", err)
+				return nil, fmt.Errorf("read config: %w", err)
 			}
 		}
 	}
 
+	var cfg config.Config
 	if err := viper.Unmarshal(&cfg); err != nil {
-		return fmt.Errorf("unmarshal config: %w", err)
+		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
-	return nil
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
