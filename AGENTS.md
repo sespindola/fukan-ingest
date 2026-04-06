@@ -185,13 +185,16 @@ event.H3Cell = uint64(cell)
 ```
 fukan-ingest/
 ├── cmd/
-│   ├── worker/                 # Main entry point for ETL workers
-│   │   └── main.go
-│   ├── batcher/                # Main entry point for ClickHouse batchers
-│   │   └── main.go
-│   └── propagator/             # Satellite TLE propagation service
-│       └── main.go
+│   └── fukan-ingest/            # Unified CLI binary (Cobra)
+│       ├── main.go              # Entry point — executes rootCmd
+│       ├── root.go              # Root command, Viper config init
+│       ├── version.go           # `fukan-ingest version` subcommand
+│       ├── worker.go            # `fukan-ingest worker --type <feed>` subcommand
+│       └── batcher.go           # `fukan-ingest batcher --type <asset>` subcommand
+├── config.example.yaml          # Reference YAML config (Viper)
 ├── internal/
+│   ├── config/
+│   │   └── config.go           # Typed config structs (mapstructure tags for Viper)
 │   ├── model/
 │   │   └── event.go            # FukanEvent struct (canonical schema)
 │   ├── worker/
@@ -474,18 +477,25 @@ func (d *DedupWindow) Sweep() {
 |                     | `H3Cell`            | Computed from sub-satellite point     |
 
 **Sources:**
-- CelesTrak (public catalog, daily HTTP fetch of GP data)
-- McCant's classified list (community-derived military TLEs)
+- CelesTrak (public catalog, daily HTTP fetch of GP data) — primary source for all unclassified objects
+- planet4589.org / JSR Satellite Catalog (Jonathan McDowell) — supplemental source for classified/military objects not in the official US Space Command catalog. Community-derived from independent observations. Replaces the retired McCant's classified list. Note: uses its own catalog format (not standard TLE), parser must handle separately.
 
 **Propagation pipeline:**
 ```
-1. Fetch TLEs from CelesTrak every 24 hours
-2. Store raw TLE lines in memory (or local file cache)
-3. Run SGP4 propagation every 10 seconds for active satellites
-4. Emit FukanEvent for each computed position
-5. Maneuver detection: compare daily TLE mean motion / inclination
+1. Fetch TLEs from CelesTrak every 24 hours (primary catalog)
+2. Fetch supplemental classified object data from planet4589.org (daily)
+3. Store raw TLE lines in memory (or local file cache)
+4. Run SGP4 propagation at regime-appropriate intervals:
+   - LEO (< 2,000 km): every 10 seconds
+   - MEO (2,000–35,786 km): every 30 seconds
+   - GEO (~35,786 km): every 60–300 seconds (barely moves)
+   - HEO (elliptical): every 10 seconds (fast-moving perigee)
+5. Emit FukanEvent for each computed position
+6. Enrich metadata with orbit regime: {"regime":"leo"}, {"regime":"geo"}, etc.
+7. For planet4589.org objects, tag confidence: {"confidence":"community_derived"}
+8. Maneuver detection: compare daily TLE mean motion / inclination
    - If delta exceeds threshold → set metadata: {"status":"maneuvering"}
-6. Decay detection: monitor BSTAR drag term + perigee altitude
+9. Decay detection: monitor BSTAR drag term + perigee altitude
    - If perigee < 150km → set metadata: {"status":"decaying"}
 ```
 
@@ -787,18 +797,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-# Build worker binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o /worker ./cmd/worker
-# Build batcher binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o /batcher ./cmd/batcher
-# Build propagator binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o /propagator ./cmd/propagator
+# Build unified binary (Cobra CLI — worker/batcher/version are subcommands)
+RUN CGO_ENABLED=0 GOOS=linux go build -o /fukan-ingest ./cmd/fukan-ingest
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /worker /usr/local/bin/worker
-COPY --from=builder /batcher /usr/local/bin/batcher
-COPY --from=builder /propagator /usr/local/bin/propagator
+COPY --from=builder /fukan-ingest /usr/local/bin/fukan-ingest
 ```
 
 ### k3s Critical Notes
@@ -811,7 +815,55 @@ COPY --from=builder /propagator /usr/local/bin/propagator
 
 ---
 
-## Environment Variables
+## Configuration (Viper + Cobra)
+
+The CLI uses **Cobra** for subcommands and **Viper** for configuration. Configuration is resolved in this priority order (highest wins):
+
+1. CLI flags (e.g. `--type adsb`)
+2. Environment variables (e.g. `NATS_URL`, `CLICKHOUSE_ADDR`)
+3. YAML config file (`--config path` or `./config.yaml` or `/etc/fukan-ingest/config.yaml`)
+4. Built-in defaults
+
+See `config.example.yaml` for the full YAML schema. Typed config structs live in `internal/config/config.go`.
+
+### CLI Usage
+
+```bash
+# Worker (--type is required)
+fukan-ingest worker --type adsb --config config.yaml
+
+# Batcher (--type defaults to "aircraft")
+fukan-ingest batcher --type vessel --config config.yaml
+
+# Version
+fukan-ingest version
+```
+
+### YAML Config Structure
+
+```yaml
+nats:
+  url: nats://localhost:4222
+clickhouse:
+  addr: localhost:9000
+  database: fukan
+  user: default
+  password: ""
+redis:
+  url: redis://localhost:6379/0
+integrations:
+  adsb:
+    - name: adsb_exchange
+      api_url: http://feed-url
+      api_key: KEY
+      interval: 2   # seconds, 0 = worker default
+```
+
+The `integrations` map allows **multiple providers per feed type**, each spawned as a separate worker goroutine.
+
+### Environment Variables (Legacy / Override)
+
+Environment variables override YAML values. The mapping uses `_` as separator (e.g. `NATS_URL` → `nats.url`):
 
 ```bash
 # NATS
@@ -826,20 +878,16 @@ CLICKHOUSE_PASSWORD=xxx
 # Redis (pub/sub for live streaming)
 REDIS_URL=redis://redis:6379/0
 
-# Feed API keys
+# Feed API keys (legacy fallback when no YAML integrations configured)
 ADSB_FEED_URL=xxx
+ADSB_SOURCE=adsb_exchange
 AISSTREAM_API_KEY=xxx
 CELESTRAK_URL=https://celestrak.org/NORAD/elements/gp.php
+PLANET4589_URL=https://planet4589.org/space/gcat/data/cat/satcat.tsv
 BGPSTREAM_PROJECT=ris-live
 
 # GeoIP
 MAXMIND_DB_PATH=/data/GeoLite2-ASN.mmdb
-
-# Worker config
-WORKER_TYPE=adsb|ais|tle|bgp|news    # which feed this worker instance consumes
-BATCHER_ASSET_TYPE=aircraft|vessel|satellite|bgp_node|news
-BATCH_SIZE=10000
-BATCH_FLUSH_INTERVAL=2s
 ```
 
 ---
@@ -916,10 +964,8 @@ Before marking any task complete:
 ## Quick Reference
 
 ```bash
-# Build
-go build ./cmd/worker
-go build ./cmd/batcher
-go build ./cmd/propagator
+# Build (single unified binary)
+go build ./cmd/fukan-ingest
 
 # Test
 go test ./...                              # All tests
@@ -927,9 +973,13 @@ go test ./internal/worker/adsb/...         # ADS-B parser tests
 go test ./internal/batcher/...             # Batcher tests
 go test -tags integration ./...            # Integration tests (needs Docker)
 
-# Run locally
-WORKER_TYPE=ais NATS_URL=nats://localhost:4222 ./worker
-BATCHER_ASSET_TYPE=vessel NATS_URL=nats://localhost:4222 CLICKHOUSE_ADDR=localhost:9000 ./batcher
+# Run locally (Cobra subcommands + Viper config)
+./fukan-ingest worker --type adsb --config config.yaml
+./fukan-ingest batcher --type aircraft --config config.yaml
+./fukan-ingest version
+
+# Legacy env-var mode still works (Viper env bindings)
+ADSB_FEED_URL=http://feed NATS_URL=nats://localhost:4222 ./fukan-ingest worker --type adsb
 
 # Docker
 docker build -t fukan-ingest -f deploy/docker/Dockerfile .

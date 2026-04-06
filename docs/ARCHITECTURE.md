@@ -40,49 +40,54 @@ External Feeds (ADS-B, AIS, TLE, BGP, News)
 
 ---
 
-## Binaries
+## CLI (Cobra + Viper)
 
-### `cmd/worker` — ETL Worker
+A single unified binary `cmd/fukan-ingest` uses **Cobra** for subcommands and **Viper** for layered configuration (CLI flags > env vars > YAML file > defaults).
 
-Connects to an external data feed, normalizes events into `FukanEvent`, and publishes to NATS.
+Configuration is loaded via `--config <path>` flag or auto-discovered at `./config.yaml` / `/etc/fukan-ingest/config.yaml`. Typed config structs live in `internal/config/config.go` with `mapstructure` tags for Viper unmarshalling. Legacy environment variables (e.g. `NATS_URL`, `CLICKHOUSE_ADDR`) are explicitly bound and continue to work as overrides.
 
-**Environment variables:**
+### Subcommands
 
-| Variable | Default | Description |
-|---|---|---|
-| `WORKER_TYPE` | `adsb` | Which feed to consume: `adsb`, `ais`, `tle`, `bgp`, `news` |
-| `NATS_URL` | `nats://localhost:4222` | NATS server address |
-| `ADSB_FEED_URL` | *(required for adsb)* | HTTP endpoint to poll |
-| `ADSB_SOURCE` | `adsb_exchange` | Provider identifier written to `Source` field |
+#### `fukan-ingest worker --type <feed>`
+
+Connects to external data feeds, normalizes events into `FukanEvent`, and publishes to NATS. Reads the `integrations.<feed>` section from config to spawn one worker goroutine per configured provider.
 
 ```bash
-WORKER_TYPE=adsb \
-NATS_URL=nats://localhost:4222 \
-ADSB_FEED_URL=https://example.com/feed \
-  go run ./cmd/worker
+# Via config file
+fukan-ingest worker --type adsb --config config.yaml
+
+# Via env vars (legacy fallback — creates a single integration from ADSB_FEED_URL)
+ADSB_FEED_URL=https://example.com/feed NATS_URL=nats://localhost:4222 \
+  fukan-ingest worker --type adsb
 ```
 
-### `cmd/batcher` — ClickHouse Batcher
+#### `fukan-ingest batcher --type <asset>`
 
 Subscribes to NATS, accumulates events in memory, and flushes to ClickHouse in batches. Publishes each batch to Redis for real-time streaming.
 
-**Environment variables:**
-
-| Variable | Default | Description |
-|---|---|---|
-| `BATCHER_ASSET_TYPE` | `aircraft` | Asset type to consume: `aircraft`, `vessel`, `satellite`, `bgp_node`, `news` |
-| `NATS_URL` | `nats://localhost:4222` | NATS server address |
-| `CLICKHOUSE_ADDR` | `localhost:9000` | ClickHouse native protocol address |
-| `CLICKHOUSE_DATABASE` | `fukan` | Target database |
-| `CLICKHOUSE_USER` | `default` | Auth user |
-| `CLICKHOUSE_PASSWORD` | *(empty)* | Auth password |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
-
 ```bash
-BATCHER_ASSET_TYPE=aircraft \
-CLICKHOUSE_ADDR=localhost:9000 \
-  go run ./cmd/batcher
+fukan-ingest batcher --type aircraft --config config.yaml
 ```
+
+#### `fukan-ingest version`
+
+Prints version, commit, and build date (set via `-ldflags` at build time).
+
+### Configuration Reference
+
+See `config.example.yaml` for the full YAML schema. Key sections:
+
+| YAML key | Env var override | Default | Description |
+|---|---|---|---|
+| `nats.url` | `NATS_URL` | `nats://localhost:4222` | NATS server address |
+| `clickhouse.addr` | `CLICKHOUSE_ADDR` | `localhost:9000` | ClickHouse native protocol address |
+| `clickhouse.database` | `CLICKHOUSE_DATABASE` | `fukan` | Target database |
+| `clickhouse.user` | `CLICKHOUSE_USER` | `default` | Auth user |
+| `clickhouse.password` | `CLICKHOUSE_PASSWORD` | *(empty)* | Auth password |
+| `redis.url` | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
+| `integrations.<feed>[]` | — | — | List of providers per feed type |
+
+Each integration entry has: `name`, `api_url`, `api_key`, `interval` (seconds, 0 = worker default).
 
 ---
 
@@ -146,10 +151,16 @@ Dual-threshold batching engine.
 - **Worker interface** — `Run(ctx) error`, `Name() string`.
 - **RunWithReconnect** — Exponential backoff reconnect loop (1s initial, 60s cap). Resets backoff if the connection lasted longer than 60s.
 
+### `internal/config`
+
+Typed configuration structs with `mapstructure` tags for Viper unmarshalling:
+- `Config` (top-level) → `NATSConfig`, `ClickHouseConfig`, `RedisConfig`, `Integrations map[string][]IntegrationConfig`
+- `IntegrationConfig` → `Name`, `APIURL`, `APIKey`, `Interval`
+
 ### `internal/worker/adsb`
 
 HTTP-polling ADS-B worker:
-1. Polls `ADSB_FEED_URL` every 5 seconds.
+1. Polls the configured `api_url` at the configured interval (default 5 seconds).
 2. `ParseFeed` deserializes the JSON response, normalizes each aircraft to `FukanEvent` (ICAO hex → uppercase, feet → meters, compute H3, build squawk metadata).
 3. Validates and publishes each event to `fukan.telemetry.aircraft`.
 
@@ -184,17 +195,21 @@ Three tables defined in `scripts/clickhouse-init.sql`:
 # Start infrastructure
 docker compose up -d    # NATS :4222, ClickHouse :9000, Redis :6379
 
-# Run worker
-WORKER_TYPE=adsb ADSB_FEED_URL=https://... go run ./cmd/worker
+# Run worker (Cobra subcommand + Viper config)
+go run ./cmd/fukan-ingest worker --type adsb --config config.yaml
+
+# Or with legacy env vars
+ADSB_FEED_URL=https://... NATS_URL=nats://localhost:4222 \
+  go run ./cmd/fukan-ingest worker --type adsb
 
 # Run batcher
-BATCHER_ASSET_TYPE=aircraft go run ./cmd/batcher
+go run ./cmd/fukan-ingest batcher --type aircraft --config config.yaml
 
 # Test
 go test ./...
 
 # Verify shutdown behavior
-go run ./cmd/batcher &
+go run ./cmd/fukan-ingest batcher --type aircraft &
 kill -TERM $!    # should see "final flush" in logs
 ```
 
@@ -218,7 +233,10 @@ Operational impact: allocate disk for JetStream, monitor stream sizes, and tune 
 
 | Package | Purpose |
 |---|---|
+| `github.com/spf13/cobra` | CLI framework — subcommands, flags, help |
+| `github.com/spf13/viper` | Configuration — YAML files, env vars, defaults |
 | `github.com/ClickHouse/ch-go` | ClickHouse native protocol client |
 | `github.com/nats-io/nats.go` | NATS client |
 | `github.com/redis/go-redis/v9` | Redis client |
 | `github.com/uber/h3-go/v4` | H3 geospatial indexing |
+| `golang.org/x/sync/errgroup` | Concurrent worker goroutine management |

@@ -1,8 +1,12 @@
 # Binaries
+/fukan-ingest
 worker
 batcher
 propagator
 *.exe
+
+# Config (may contain secrets)
+config.yaml
 
 # Environment
 .env
