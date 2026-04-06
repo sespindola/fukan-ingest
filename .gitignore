@@ -1,8 +1,5 @@
 # Binaries
 /fukan-ingest
-worker
-batcher
-propagator
 *.exe
 
 # Config (may contain secrets)

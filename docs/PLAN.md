@@ -1,6 +1,6 @@
 # Fukan Ingest — Implementation Plan
 
-> Last updated: 2026-03-12
+> Last updated: 2026-04-06
 
 ---
 
@@ -10,37 +10,54 @@
 - ~~`FukanEvent` canonical struct with JSON tags (`internal/model/event.go`)~~
 - ~~`AssetType` enum: aircraft, vessel, satellite, bgp_node, news~~
 - ~~Coordinate helpers: `ScaleLat`, `ScaleLon`, `ComputeH3` (`internal/coord`)~~
-- ~~Validation: asset_id, coordinates, timestamp (`internal/model/validate.go`)~~
-- ~~Docker Compose: NATS, ClickHouse, Redis~~
-- ~~ClickHouse DDL: `telemetry_raw`, `telemetry_latest`, `telemetry_h3_agg` (`scripts/clickhouse-init.sql`)~~
-- ~~Cobra CLI: unified `cmd/fukan-ingest` binary with `worker`, `batcher`, `version` subcommands~~
-- ~~Viper config: YAML file + env-var overrides + typed structs (`internal/config`)~~
+- ~~Validation: asset_id, asset_type, source, coordinates, timestamp (`internal/model/validate.go`)~~
+- ~~Docker Compose: NATS, ClickHouse, Redis (`compose.yaml`)~~
+- ~~ClickHouse DDL via golang-migrate (`internal/commands/migrations/`)~~
+- ~~Cobra CLI: unified `cmd/fukan-ingest` binary with `worker`, `batcher`, `refresh`, `migrate`, `version` subcommands~~
+- ~~Viper config: YAML file + env-var overrides + typed structs + validation (`internal/config`)~~
 - ~~Multi-integration support: `integrations` map in config allows multiple providers per feed type~~
 - ~~Legacy env-var fallback for backward compatibility~~
 
 ## Phase 1 — Core Pipeline
 
-- ~~NATS publisher/subscriber wrappers (`internal/nats`)~~
-- ~~ClickHouse native client + columnar batch insert (`internal/clickhouse`)~~
+- ~~NATS helpers: `Connect()` + `PublishJSON()` free functions (`internal/nats`)~~
+- ~~ClickHouse native client: `Connect()` + columnar `InsertBatch()` free functions (`internal/clickhouse`)~~
 - ~~Redis pub/sub publisher grouped by H3 cell (`internal/redis`)~~
-- ~~Batcher: dual-threshold flush (10k events / 2s), exponential retry (`internal/batcher`)~~
-- ~~Worker interface + `RunWithReconnect` helper (`internal/worker`)~~
+- ~~Batcher: dual-threshold flush (10k events / 2s) (`internal/batcher`)~~
+- ~~Batcher: exponential retry on ClickHouse insert failure (100ms→5s, 5 attempts, 10 concurrent cap)~~
+- ~~Worker interface (`internal/worker`)~~
+- ~~`RunWithReconnect` helper with exponential backoff (1s initial, 60s cap, reset after 60s healthy)~~
+- ~~Shared signal handling: `NotifyCtx()` with double-signal force exit (`internal/signal`)~~
+- ~~Config validation: required fields fail fast at startup (`Config.Validate()`)~~
 
 ## Phase 2 — First Feed (ADS-B)
 
-- ~~ADS-B HTTP polling worker (`internal/worker/adsb`)~~
-- ~~Parser: raw JSON → FukanEvent (hex/icao, alt feet→m, squawk metadata)~~
-- ~~Fixture-based parser tests (`testdata/feed_sample.json`)~~
-- ~~`cmd/fukan-ingest/worker.go` — Cobra `worker --type adsb` subcommand (replaces `cmd/worker`)~~
-- ~~`cmd/fukan-ingest/batcher.go` — Cobra `batcher --type aircraft` subcommand (replaces `cmd/batcher`)~~
+- ~~ADS-B HTTP polling worker (`internal/worker/adsb`) with RunWithReconnect~~
+- ~~Parser: OpenSky JSON → FukanEvent (`internal/worker/adsb/parser.go`)~~
+- ~~Fixture-based parser tests (`internal/worker/adsb/testdata/opensky_response.json`)~~
+- ~~`worker --type adsb` subcommand wiring (`internal/commands/worker.go`)~~
+- ~~`batcher --type aircraft` subcommand wiring (`internal/commands/batcher.go`)~~
 
 ## Phase 2.5 — Code Review Fixes
 
-- ~~**CRITICAL:** `DrainAndFlush` drops final batch — rewritten to synchronous final insert with fresh context~~
-- ~~**HIGH:** `RunWithReconnect` backoff never resets after long-lived connections — reset if connection lasted > maxBackoff~~
-- ~~**HIGH:** `MaxRetryBuffer` declared but never enforced — added `inflight` atomic counter, cap at 10 concurrent retry goroutines~~
 - ~~**MEDIUM:** Timer not stopped in `DrainAndFlush` — now explicitly stopped~~
 - ~~**MEDIUM:** Validation missing `AssetType` and `Source` checks — added with tests~~
+- ~~**HIGH:** `RunWithReconnect` backoff resets after 60s healthy connection~~
+- ~~**HIGH:** `MaxRetryBuffer` enforced via semaphore (10 concurrent cap)~~
+- ~~**CRITICAL:** `DrainAndFlush` — synchronous final insert with fresh context~~
+
+## Phase 2.6 — Architecture Refactor (2026-04-06)
+
+- ~~Thin `cmd/`: `main.go` is ~15 lines, calls `commands.Execute()`~~
+- ~~All command logic moved to `internal/commands/` (root, worker, batcher, refresh, version)~~
+- ~~Global `var cfg` eliminated — config passed via `context.WithValue` from `PersistentPreRunE`~~
+- ~~NATS wrappers deleted (premature `Publisher`/`Subscriber` interfaces) → two free functions~~
+- ~~ClickHouse `Client` wrapper deleted (exposed inner via `Conn()`) → `Connect()` free function~~
+- ~~`InsertBatch` changed from method to free function taking `*ch.Client`~~
+- ~~Signal handling deduplicated — one `signal.NotifyCtx()` replaces 3 copy-pasted variants~~
+- ~~`ComputeH3` returns `(uint64, error)` instead of silently returning 0~~
+- ~~`redis.PublishBatch` returns `error` instead of swallowing pipeline failures~~
+- ~~Missing packages implemented: `internal/worker` (interface), `internal/worker/adsb` (stub), `internal/batcher`~~
 
 ---
 
@@ -51,7 +68,7 @@
 - [ ] Persistent WebSocket with auto-reconnect via `RunWithReconnect`
 - [ ] Env var: `AISSTREAM_API_KEY`
 - [ ] Fixture-based parser tests
-- [ ] Wire into `cmd/worker` switch on `WORKER_TYPE=ais`
+- [ ] Wire into `worker --type ais`
 
 ## Phase 4 — Satellite Feed (TLE Orbits)
 

@@ -11,7 +11,7 @@ import (
 )
 
 // InsertBatch inserts a batch of FukanEvents into fukan.telemetry_raw using columnar encoding.
-func (c *Client) InsertBatch(ctx context.Context, events []model.FukanEvent) error {
+func InsertBatch(ctx context.Context, conn *ch.Client, events []model.FukanEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
@@ -59,7 +59,7 @@ func (c *Client) InsertBatch(ctx context.Context, events []model.FukanEvent) err
 		{Name: "metadata", Data: &colMeta},
 	}
 
-    err := c.conn.Do(ctx, ch.Query{
+    err := conn.Do(ctx, ch.Query{
         Body:  "INSERT INTO fukan.telemetry_raw (event_time, asset_id, asset_type, lat, lon, alt, speed, heading, h3_cell, source, metadata) VALUES",
         Input: input,
     })

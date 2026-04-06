@@ -1,17 +1,17 @@
-package main
+package commands
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/sespindola/fukan-ingest/internal/config"
-	natsPub "github.com/sespindola/fukan-ingest/internal/nats"
+	fukanNats "github.com/sespindola/fukan-ingest/internal/nats"
 	"github.com/sespindola/fukan-ingest/internal/oauth2"
+	fukanSignal "github.com/sespindola/fukan-ingest/internal/signal"
 	"github.com/sespindola/fukan-ingest/internal/worker"
 	"github.com/sespindola/fukan-ingest/internal/worker/adsb"
 	"github.com/spf13/cobra"
@@ -19,25 +19,26 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var workerType string
+func newWorkerCmd() *cobra.Command {
+	var workerType string
 
-var workerCmd = &cobra.Command{
-	Use:   "worker",
-	Short: "Run feed ingestion worker(s)",
-	RunE:  runWorker,
+	cmd := &cobra.Command{
+		Use:   "worker",
+		Short: "Run feed ingestion worker(s)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runWorker(cmd.Context(), configFrom(cmd), workerType)
+		},
+	}
+	cmd.Flags().StringVar(&workerType, "type", "", "feed type (e.g. adsb)")
+	_ = cmd.MarkFlagRequired("type")
+	return cmd
 }
 
-func init() {
-	workerCmd.Flags().StringVar(&workerType, "type", "", "feed type (e.g. adsb)")
-	_ = workerCmd.MarkFlagRequired("type")
-	rootCmd.AddCommand(workerCmd)
-}
-
-func runWorker(cmd *cobra.Command, args []string) error {
-	integrations := cfg.Integrations[workerType]
+func runWorker(ctx context.Context, cfg *config.Config, feedType string) error {
+	integrations := cfg.Integrations[feedType]
 
 	// Legacy fallback: if no integrations configured, check env vars.
-	if len(integrations) == 0 && workerType == "adsb" {
+	if len(integrations) == 0 && feedType == "adsb" {
 		feedURL := os.Getenv("ADSB_FEED_URL")
 		if feedURL != "" {
 			source := os.Getenv("ADSB_SOURCE")
@@ -63,30 +64,22 @@ func runWorker(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(integrations) == 0 {
-		return fmt.Errorf("no integrations configured for feed type %q", workerType)
+		return fmt.Errorf("no integrations configured for feed type %q", feedType)
 	}
 
-	pub, err := natsPub.NewPublisher(cfg.NATS.URL)
+	nc, err := fukanNats.Connect(cfg.NATS.URL)
 	if err != nil {
-		return fmt.Errorf("nats connect: %w", err)
+		return err
 	}
-	defer pub.Close()
+	defer nc.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := fukanSignal.NotifyCtx(ctx)
 	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-sigCh
-		slog.Info("shutting down workers")
-		cancel()
-	}()
 
 	g, gctx := errgroup.WithContext(ctx)
 
 	for _, ic := range integrations {
-		w, err := newWorker(workerType, ic, pub)
+		w, err := newWorker(feedType, ic, nc)
 		if err != nil {
 			cancel()
 			return err
@@ -101,14 +94,14 @@ func runWorker(cmd *cobra.Command, args []string) error {
 		slog.Error("worker failed", "err", err)
 	}
 
-	if err := pub.Drain(); err != nil {
+	if err := nc.Drain(); err != nil {
 		slog.Warn("nats drain failed", "err", err)
 	}
 	slog.Info("all workers stopped")
 	return nil
 }
 
-func newWorker(feedType string, ic config.IntegrationConfig, pub natsPub.Publisher) (worker.Worker, error) {
+func newWorker(feedType string, ic config.IntegrationConfig, nc *nats.Conn) (worker.Worker, error) {
 	switch feedType {
 	case "adsb":
 		var opts []adsb.Option
@@ -125,7 +118,7 @@ func newWorker(feedType string, ic config.IntegrationConfig, pub natsPub.Publish
 			}
 			opts = append(opts, adsb.WithOAuth2(ic.ClientID, ic.ClientSecret, tokenURL))
 		}
-		return adsb.New(ic.APIURL, ic.Name, pub, opts...), nil
+		return adsb.New(ic.APIURL, ic.Name, nc, opts...), nil
 	default:
 		return nil, fmt.Errorf("unknown feed type: %s", feedType)
 	}

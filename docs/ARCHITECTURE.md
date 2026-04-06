@@ -25,7 +25,6 @@ External Feeds (ADS-B, AIS, TLE, BGP, News)
 ┌──────────────────────────────────────────┐
 │ Batchers (one per asset type)            │
 │  Accumulate 10k events OR 2s timeout     │
-│  Retry with exponential backoff          │
 └─────────┬────────────────┬───────────────┘
           │                │
           ▼                ▼
@@ -44,7 +43,11 @@ External Feeds (ADS-B, AIS, TLE, BGP, News)
 
 A single unified binary `cmd/fukan-ingest` uses **Cobra** for subcommands and **Viper** for layered configuration (CLI flags > env vars > YAML file > defaults).
 
-Configuration is loaded via `--config <path>` flag or auto-discovered at `./config.yaml` / `/etc/fukan-ingest/config.yaml`. Typed config structs live in `internal/config/config.go` with `mapstructure` tags for Viper unmarshalling. Legacy environment variables (e.g. `NATS_URL`, `CLICKHOUSE_ADDR`) are explicitly bound and continue to work as overrides.
+The entrypoint (`cmd/fukan-ingest/main.go`) is ~15 lines — it sets up structured logging and calls `commands.Execute()`. All command logic lives in `internal/commands/`.
+
+Configuration is loaded via `--config <path>` flag or auto-discovered at `./config.yaml` / `/etc/fukan-ingest/config.yaml`. Typed config structs live in `internal/config/config.go` with `mapstructure` tags for Viper unmarshalling. Required fields are validated at startup via `Config.Validate()`. Legacy environment variables (e.g. `NATS_URL`, `CLICKHOUSE_ADDR`) are explicitly bound and continue to work as overrides.
+
+Config is passed to subcommands via `context.WithValue` from `PersistentPreRunE` — no global mutable state.
 
 ### Subcommands
 
@@ -69,6 +72,25 @@ Subscribes to NATS, accumulates events in memory, and flushes to ClickHouse in b
 fukan-ingest batcher --type aircraft --config config.yaml
 ```
 
+#### `fukan-ingest refresh --target <target>`
+
+Refreshes reference data from external sources. Currently supports `--target airlines` to download the OpenSky aircraft database CSV (~600k rows) and load into ClickHouse. Supports `--dry-run` to parse without writing.
+
+```bash
+fukan-ingest refresh --target airlines --config config.yaml
+```
+
+#### `fukan-ingest migrate [up|down|version]`
+
+Manages ClickHouse schema migrations. Migration SQL files are embedded in the binary via `embed.FS`.
+
+```bash
+fukan-ingest migrate up                   # apply all pending migrations
+fukan-ingest migrate down                 # revert all migrations
+fukan-ingest migrate down -n 1            # revert last migration
+fukan-ingest migrate version              # print current version
+```
+
 #### `fukan-ingest version`
 
 Prints version, commit, and build date (set via `-ldflags` at build time).
@@ -87,7 +109,45 @@ See `config.example.yaml` for the full YAML schema. Key sections:
 | `redis.url` | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
 | `integrations.<feed>[]` | — | — | List of providers per feed type |
 
-Each integration entry has: `name`, `api_url`, `api_key`, `interval` (seconds, 0 = worker default).
+Each integration entry has: `name`, `api_url`, `api_key`, `interval` (seconds, 0 = worker default), `client_id`, `client_secret`, `token_url`.
+
+---
+
+## Project Structure
+
+```
+cmd/fukan-ingest/
+  main.go                          # Entry point (~15 lines)
+
+internal/
+  commands/
+    root.go                        # Root command, config loading via context
+    worker.go                      # worker subcommand
+    batcher.go                     # batcher subcommand
+    refresh.go                     # refresh subcommand
+    migrate.go                     # migrate subcommand (up/down/version)
+    version.go                     # version subcommand
+    migrations/                    # Embedded SQL migration files
+      000001_create_telemetry_tables.{up,down}.sql
+      000002_create_aircraft_meta.{up,down}.sql
+
+  config/config.go                 # Typed config structs + Validate()
+  model/event.go                   # FukanEvent canonical struct
+  model/validate.go                # Event validation rules
+  coord/coord.go                   # ScaleLat, ScaleLon, ComputeH3
+  nats/nats.go                     # Connect() + PublishJSON()
+  clickhouse/clickhouse.go         # Connect() (dial + ping)
+  clickhouse/insert.go             # InsertBatch() columnar insert
+  redis/publisher.go               # H3-grouped pub/sub publisher
+  oauth2/token.go                  # OAuth2 client credentials (OpenSky)
+  signal/signal.go                 # NotifyCtx() shared signal handling
+  refresh/aircraft.go              # OpenSky CSV → ClickHouse loader
+
+  worker/worker.go                 # Worker interface + RunWithReconnect
+  worker/adsb/worker.go            # ADS-B HTTP polling worker
+  worker/adsb/parser.go            # OpenSky JSON → FukanEvent
+  batcher/batcher.go               # Dual-threshold batch accumulator
+```
 
 ---
 
@@ -118,51 +178,66 @@ Validation rejects: empty `AssetID`/`AssetType`/`Source`, null-island `(0,0)`, o
 ### `internal/coord`
 
 - `ScaleLat(float64) int32` / `ScaleLon(float64) int32` — multiply by 10,000,000
-- `ComputeH3(lat, lon float64) uint64` — H3 cell at resolution 7 (~5.16 km²)
+- `ComputeH3(lat, lon float64) (uint64, error)` — H3 cell at resolution 7 (~5.16 km²)
 
 H3 is always computed in the worker, never in ClickHouse.
 
 ### `internal/nats`
 
-Thin wrappers around `nats.go`:
-- **Publisher** — `Publish(subject, event)` serializes to JSON and publishes.
-- **Subscriber** — `QueueSubscribe(subject, queue, handler)` for load-balanced consumption.
+Two free functions — no wrappers, no interfaces:
+- `Connect(url) (*nats.Conn, error)` — dials NATS, returns the bare connection.
+- `PublishJSON(nc, subject, v) error` — marshals to JSON and publishes.
+
+Callers use `*nats.Conn` directly for `QueueSubscribe`, `Drain`, `Close`.
 
 ### `internal/batcher`
 
-Dual-threshold batching engine.
+Dual-threshold batching engine with retry.
 
 - **Size threshold:** 10,000 events triggers immediate flush.
 - **Time threshold:** 2-second `AfterFunc` timer triggers flush if buffer is non-empty.
-- **Retry:** Failed inserts retry with exponential backoff (100ms initial, 5s cap). In-flight retry goroutines are capped at `MaxRetryBuffer / MaxBatchSize` (10) to prevent unbounded memory growth.
-- **Shutdown:** `DrainAndFlush()` cancels retry loops, waits for in-flight goroutines, then does a synchronous final insert with a 10-second timeout against a fresh context.
+- **Retry:** Failed inserts retry with exponential backoff (100ms initial, 5s cap, 5 attempts). In-flight retry goroutines capped at 10 via semaphore.
+- **Shutdown:** `DrainAndFlush()` flushes remaining buffer, then waits for all in-flight retries to complete.
 
 ### `internal/clickhouse`
 
-- **Client** — `ch-go` native protocol connection (`NewClient`, `Ping`, `Close`).
-- **InsertBatch** — Columnar batch insert into `fukan.telemetry_raw`. Builds `proto.Input` with 11 columns using codec-aware types (DoubleDelta for coords/timestamps, Gorilla for speed/heading, LowCardinality for asset_type/source).
+Two free functions — no wrapper types:
+- `Connect(ctx, cfg) (*ch.Client, error)` — dials via native protocol and pings. Returns bare `*ch.Client`.
+- `InsertBatch(ctx, conn, events) error` — columnar batch insert into `fukan.telemetry_raw`. Uses LowCardinality for `asset_type` and `source`.
 
 ### `internal/redis`
 
-- **PublishBatch** — Groups events by H3 cell, publishes JSON to Redis channels `telemetry:{h3_cell}` using a pipeline. Failures are logged but non-fatal.
+- `Publisher` struct with `PublishBatch(ctx, events) error` — groups events by H3 cell, publishes JSON to Redis channels `telemetry:{h3_cell}` using a pipeline. Per-event marshal failures are logged and skipped; pipeline exec errors are returned to the caller.
+
+### `internal/signal`
+
+- `NotifyCtx(parent) (context.Context, CancelFunc)` — cancels context on SIGTERM/SIGINT. A second signal forces `os.Exit(1)`. Used by all commands.
 
 ### `internal/worker`
 
-- **Worker interface** — `Run(ctx) error`, `Name() string`.
-- **RunWithReconnect** — Exponential backoff reconnect loop (1s initial, 60s cap). Resets backoff if the connection lasted longer than 60s.
+- `Worker` interface — `Run(ctx) error`, `Name() string`.
+- `RunWithReconnect(ctx, name, fn)` — wraps any `func(ctx) error` with exponential backoff (1s→60s). Resets backoff if the function ran for >60s (long-lived = healthy).
+
+### `internal/worker/adsb`
+
+- `ADSBWorker` struct with functional options (`WithInterval`, `WithAPIKey`, `WithOAuth2`).
+- `Run()` delegates to `RunWithReconnect` wrapping an HTTP poll loop.
+- `ParseStates(body, source)` — parses OpenSky `/states/all` JSON (positional arrays) into `[]FukanEvent`. Handles null fields, m/s→knots, coordinate scaling, H3 computation. Skips on-ground and no-position aircraft.
+
+### `internal/oauth2`
+
+- `TokenSource` — OAuth2 client credentials flow for OpenSky Network. Caches tokens with 60-second refresh margin. Thread-safe.
+
+### `internal/refresh`
+
+- `Aircraft(ctx, conn, csvURL, token, dryRun)` — downloads OpenSky aircraft database CSV, parses ~600k rows, batch-inserts into `fukan.aircraft_meta` (50k rows per batch). Preserves existing image URLs across refreshes.
 
 ### `internal/config`
 
 Typed configuration structs with `mapstructure` tags for Viper unmarshalling:
-- `Config` (top-level) → `NATSConfig`, `ClickHouseConfig`, `RedisConfig`, `Integrations map[string][]IntegrationConfig`
-- `IntegrationConfig` → `Name`, `APIURL`, `APIKey`, `Interval`
-
-### `internal/worker/adsb`
-
-HTTP-polling ADS-B worker:
-1. Polls the configured `api_url` at the configured interval (default 5 seconds).
-2. `ParseFeed` deserializes the JSON response, normalizes each aircraft to `FukanEvent` (ICAO hex → uppercase, feet → meters, compute H3, build squawk metadata).
-3. Validates and publishes each event to `fukan.telemetry.aircraft`.
+- `Config` (top-level) → `NATSConfig`, `ClickHouseConfig`, `RedisConfig`, `OpenSkyConfig`, `Integrations map[string][]IntegrationConfig`
+- `IntegrationConfig` → `Name`, `APIURL`, `APIKey`, `Interval`, `ClientID`, `ClientSecret`, `TokenURL`
+- `Validate()` — checks required fields (`nats.url`, `clickhouse.addr`, `clickhouse.database`, `redis.url`).
 
 ---
 
@@ -173,19 +248,20 @@ HTTP-polling ADS-B worker:
 | Best-effort delivery | NATS core (RAM-only). No persistence or redelivery. |
 | Durability | None at broker level; data can be lost on restarts. |
 | Load distribution | NATS queue groups: `batcher-{asset_type}` share work. |
-| Backpressure | None from broker; batcher flush/retry controls local memory. |
-| CH failure behavior | In-process retry with backoff; loss if process exits. |
-| Shutdown behavior | Batchers `DrainAndFlush()`; NATS publisher `Drain()` to flush. |
+| Backpressure | None from broker; batcher flush controls local memory. |
+| CH failure behavior | Retry with exponential backoff (100ms→5s, 5 attempts, 10 concurrent cap). |
+| Shutdown behavior | Batchers `DrainAndFlush()`; NATS `Drain()` to flush pending. |
 
 ---
 
 ## ClickHouse Schema
 
-Three tables defined in `scripts/clickhouse-init.sql`:
+Managed via golang-migrate. Migration files are embedded in the binary at `internal/commands/migrations/`. Apply with `fukan-ingest migrate up`.
 
-1. **`telemetry_raw`** — MergeTree, partitioned by day, ordered by `(asset_type, asset_id, timestamp)`. TTL: 24 hours (dev/validation). Production target: 90 days with tiered storage to Cloudflare R2.
-2. **`telemetry_latest`** — ReplacingMergeTree materialized view. Latest position per `(asset_type, asset_id)`.
-3. **`telemetry_h3_agg`** — AggregatingMergeTree materialized view. 5-minute bucketed density counts per `(h3_cell, asset_type)` for heatmaps.
+1. **`telemetry_raw`** — MergeTree, partitioned by hour, ordered by `(asset_type, h3_cell, event_time, asset_id)`. TTL: 24 hours (dev/validation). Production target: 90 days with tiered storage.
+2. **`telemetry_latest`** — AggregatingMergeTree. Latest position per `(asset_type, asset_id)` via argMax aggregate states.
+3. **`telemetry_h3_agg`** — SummingMergeTree. 5-minute bucketed density counts per `(h3_cell, asset_type)` for heatmaps.
+4. **`aircraft_meta`** — ReplacingMergeTree. Aircraft reference data from OpenSky (ICAO24, registration, operator, images).
 
 ---
 
@@ -193,9 +269,12 @@ Three tables defined in `scripts/clickhouse-init.sql`:
 
 ```bash
 # Start infrastructure
-docker compose up -d    # NATS :4222, ClickHouse :9000, Redis :6379
+docker compose up -d
 
-# Run worker (Cobra subcommand + Viper config)
+# Apply ClickHouse migrations
+go run ./cmd/fukan-ingest migrate up
+
+# Run worker
 go run ./cmd/fukan-ingest worker --type adsb --config config.yaml
 
 # Or with legacy env vars
@@ -205,12 +284,14 @@ ADSB_FEED_URL=https://... NATS_URL=nats://localhost:4222 \
 # Run batcher
 go run ./cmd/fukan-ingest batcher --type aircraft --config config.yaml
 
-# Test
-go test ./...
+# Refresh aircraft metadata
+go run ./cmd/fukan-ingest refresh --target airlines --config config.yaml
 
-# Verify shutdown behavior
-go run ./cmd/fukan-ingest batcher --type aircraft &
-kill -TERM $!    # should see "final flush" in logs
+# Test
+go test ./internal/...
+
+# Build
+go build ./cmd/fukan-ingest
 ```
 
 ---
@@ -240,3 +321,4 @@ Operational impact: allocate disk for JetStream, monitor stream sizes, and tune 
 | `github.com/redis/go-redis/v9` | Redis client |
 | `github.com/uber/h3-go/v4` | H3 geospatial indexing |
 | `golang.org/x/sync/errgroup` | Concurrent worker goroutine management |
+| `github.com/golang-migrate/migrate/v4` | ClickHouse schema migrations |

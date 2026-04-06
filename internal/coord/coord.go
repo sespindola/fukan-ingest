@@ -1,6 +1,7 @@
 package coord
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/uber/h3-go/v4"
@@ -17,10 +18,10 @@ func ScaleLon(lon float64) int32 {
 }
 
 // ComputeH3 returns the H3 cell index at resolution 7 for the given coordinates.
-func ComputeH3(lat, lon float64) uint64 {
+func ComputeH3(lat, lon float64) (uint64, error) {
 	cell, err := h3.LatLngToCell(h3.LatLng{Lat: lat, Lng: lon}, 7)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("h3 cell: %w", err)
 	}
-	return uint64(cell)
+	return uint64(cell), nil
 }
