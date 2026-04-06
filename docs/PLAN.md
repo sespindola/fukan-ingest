@@ -13,6 +13,10 @@
 - ~~Validation: asset_id, coordinates, timestamp (`internal/model/validate.go`)~~
 - ~~Docker Compose: NATS, ClickHouse, Redis~~
 - ~~ClickHouse DDL: `telemetry_raw`, `telemetry_latest`, `telemetry_h3_agg` (`scripts/clickhouse-init.sql`)~~
+- ~~Cobra CLI: unified `cmd/fukan-ingest` binary with `worker`, `batcher`, `version` subcommands~~
+- ~~Viper config: YAML file + env-var overrides + typed structs (`internal/config`)~~
+- ~~Multi-integration support: `integrations` map in config allows multiple providers per feed type~~
+- ~~Legacy env-var fallback for backward compatibility~~
 
 ## Phase 1 — Core Pipeline
 
@@ -27,8 +31,8 @@
 - ~~ADS-B HTTP polling worker (`internal/worker/adsb`)~~
 - ~~Parser: raw JSON → FukanEvent (hex/icao, alt feet→m, squawk metadata)~~
 - ~~Fixture-based parser tests (`testdata/feed_sample.json`)~~
-- ~~`cmd/worker/main.go` — env-driven worker entrypoint~~
-- ~~`cmd/batcher/main.go` — env-driven batcher entrypoint~~
+- ~~`cmd/fukan-ingest/worker.go` — Cobra `worker --type adsb` subcommand (replaces `cmd/worker`)~~
+- ~~`cmd/fukan-ingest/batcher.go` — Cobra `batcher --type aircraft` subcommand (replaces `cmd/batcher`)~~
 
 ## Phase 2.5 — Code Review Fixes
 
@@ -51,13 +55,21 @@
 
 ## Phase 4 — Satellite Feed (TLE Orbits)
 
-- [ ] TLE fetcher: daily HTTP pull from CelesTrak (`internal/worker/tle/fetcher.go`)
-- [ ] SGP4 propagator: TLE → lat/lon/alt every 10s (`internal/worker/tle/propagator.go`)
+- [ ] TLE fetcher: daily HTTP pull from CelesTrak — primary catalog (`internal/worker/tle/fetcher.go`)
+- [ ] planet4589.org fetcher: daily HTTP pull of JSR Satellite Catalog for classified/military objects not in CelesTrak (`internal/worker/tle/planet4589.go`)
+- [ ] JSR catalog parser: handle planet4589.org's TSV format (separate from standard TLE parser)
+- [ ] SGP4 propagator with regime-aware intervals (`internal/worker/tle/propagator.go`):
+  - LEO (< 2,000 km): every 10s
+  - MEO (2,000–35,786 km): every 30s
+  - GEO (~35,786 km): every 60–300s
+  - HEO (elliptical): every 10s
+- [ ] Orbit regime classification: derive from orbital period/altitude, enrich metadata `{"regime":"leo"}`
+- [ ] Confidence tagging: planet4589.org objects get `{"confidence":"community_derived"}`
 - [ ] Maneuver detection: compare daily mean motion / inclination deltas → metadata `{"status":"maneuvering"}`
 - [ ] Decay detection: BSTAR drag + perigee < 150km → metadata `{"status":"decaying"}`
 - [ ] `cmd/propagator/main.go` entrypoint
-- [ ] Env vars: `CELESTRAK_URL`
-- [ ] Tests with known TLE fixtures
+- [ ] Env vars: `CELESTRAK_URL`, `PLANET4589_URL`
+- [ ] Tests with known TLE fixtures + planet4589.org format fixtures
 
 ## Phase 5 — BGP Feed (Internet Routing)
 

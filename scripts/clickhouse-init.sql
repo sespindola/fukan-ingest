@@ -69,6 +69,30 @@ SELECT
 FROM fukan.telemetry_latest
 GROUP BY asset_type, asset_id;
 
+-- Aircraft metadata reference table (monthly full refresh from OpenSky)
+-- ReplacingMergeTree deduplicates by icao24, keeping the row with latest updated_at.
+-- No TRUNCATE needed before refresh — just insert and CH handles the rest.
+CREATE TABLE IF NOT EXISTS fukan.aircraft_meta (
+    icao24              String,
+    registration        String       DEFAULT '',
+    manufacturer_name   String       DEFAULT '',
+    model               String       DEFAULT '',
+    typecode            String       DEFAULT '',
+    icao_aircraft_type  LowCardinality(String) DEFAULT '',
+    operator            String       DEFAULT '',
+    operator_callsign   String       DEFAULT '',
+    operator_icao       LowCardinality(String) DEFAULT '',
+    operator_iata       LowCardinality(String) DEFAULT '',
+    owner               String       DEFAULT '',
+    built               String       DEFAULT '',
+    status              String       DEFAULT '',
+    category_desc       String       DEFAULT '',
+    image_url           String       DEFAULT '',
+    image_attribution   String       DEFAULT '',
+    updated_at          DateTime     DEFAULT now()
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY icao24;
+
 -- 5-minute H3 density buckets for zoomed-out heatmaps
 CREATE TABLE IF NOT EXISTS fukan.telemetry_h3_agg (
     time_bucket   DateTime,

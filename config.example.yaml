@@ -1,0 +1,34 @@
+nats:
+  url: nats://localhost:4222
+
+clickhouse:
+  addr: localhost:9000
+  database: fukan
+  user: default
+  password: ""
+
+redis:
+  url: redis://localhost:6379/0
+
+# OpenSky Network credentials (shared by worker + refresh command).
+# Register at https://opensky-network.org/my-opensky/account for OAuth2 client credentials.
+# Can also be set via OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET env vars.
+opensky:
+  client_id: your-client-id
+  client_secret: your-client-secret
+  # csv_url defaults to https://opensky-network.org/datasets/metadata/aircraftDatabase.csv
+  # csv_url: https://opensky-network.org/datasets/metadata/aircraftDatabase.csv
+
+integrations:
+  adsb:
+    - name: opensky
+      api_url: https://opensky-network.org/api/states/all
+      interval: 10  # seconds (10s anon / 5s authenticated)
+    # - name: adsb_exchange
+    #   api_url: http://another-adsb-feed
+    #   api_key: YOUR_API_KEY
+    #   interval: 2
+  # ais:
+  #   - name: aisstream
+  #     api_url: wss://stream.aisstream.io/v0/stream
+  #     api_key: YOUR_KEY
