@@ -16,53 +16,64 @@ func InsertBatch(ctx context.Context, conn *ch.Client, events []model.FukanEvent
 		return nil
 	}
 
+	colEventTime := new(proto.ColDateTime64).WithPrecision(proto.PrecisionMilli)
 	var (
-		colEventTime proto.ColDateTime64
-		colAssetID   proto.ColStr
-		colType      proto.ColStr
-		colLat       proto.ColInt32
-		colLon       proto.ColInt32
-		colAlt       proto.ColInt32
-		colSpeed     proto.ColFloat32
-		colHeading   proto.ColFloat32
-		colH3        proto.ColUInt64
-		colSource    proto.ColStr
-		colMeta      proto.ColStr
+		colAssetID     proto.ColStr
+		colCallsign    proto.ColStr
+		colLat         proto.ColInt32
+		colLon         proto.ColInt32
+		colAlt         proto.ColInt32
+		colSpeed       proto.ColFloat32
+		colHeading     proto.ColFloat32
+		colVerticalRate proto.ColFloat32
+		colH3          proto.ColUInt64
+		colMeta        proto.ColStr
 	)
-	colEventTime.Precision = 3 // milliseconds, matches DateTime64(3) in schema
+	colAssetType := proto.NewLowCardinality[string](&proto.ColStr{})
+	colOrigin := proto.NewLowCardinality[string](&proto.ColStr{})
+	colCategory := proto.NewLowCardinality[string](&proto.ColStr{})
+	colSource := proto.NewLowCardinality[string](&proto.ColStr{})
 
 	for _, e := range events {
 		colEventTime.Append(time.UnixMilli(e.Timestamp))
 		colAssetID.Append(e.AssetID)
-		colType.Append(string(e.AssetType))
+		colAssetType.Append(string(e.AssetType))
+		colCallsign.Append(e.Callsign)
+		colOrigin.Append(e.Origin)
+		colCategory.Append(e.Category)
 		colLat.Append(e.Lat)
 		colLon.Append(e.Lon)
 		colAlt.Append(e.Alt)
 		colSpeed.Append(e.Speed)
 		colHeading.Append(e.Heading)
+		colVerticalRate.Append(e.VerticalRate)
 		colH3.Append(e.H3Cell)
 		colSource.Append(e.Source)
 		colMeta.Append(e.Metadata)
 	}
 
 	input := proto.Input{
-		{Name: "event_time", Data: &colEventTime},
+		{Name: "event_time", Data: colEventTime},
 		{Name: "asset_id", Data: &colAssetID},
-		{Name: "asset_type", Data: proto.NewLowCardinality(&colType)},
+		{Name: "asset_type", Data: colAssetType},
+		{Name: "callsign", Data: &colCallsign},
+		{Name: "origin", Data: colOrigin},
+		{Name: "category", Data: colCategory},
 		{Name: "lat", Data: &colLat},
 		{Name: "lon", Data: &colLon},
 		{Name: "alt", Data: &colAlt},
 		{Name: "speed", Data: &colSpeed},
 		{Name: "heading", Data: &colHeading},
+		{Name: "vertical_rate", Data: &colVerticalRate},
 		{Name: "h3_cell", Data: &colH3},
-		{Name: "source", Data: proto.NewLowCardinality(&colSource)},
+		{Name: "source", Data: colSource},
 		{Name: "metadata", Data: &colMeta},
 	}
 
-    err := conn.Do(ctx, ch.Query{
-        Body:  "INSERT INTO fukan.telemetry_raw (event_time, asset_id, asset_type, lat, lon, alt, speed, heading, h3_cell, source, metadata) VALUES",
-        Input: input,
-    })
+	err := conn.Do(ctx, ch.Query{
+		Body:  "INSERT INTO fukan.telemetry_raw (event_time, asset_id, asset_type, callsign, origin, category, lat, lon, alt, speed, heading, vertical_rate, h3_cell, source, metadata) VALUES",
+		Input: input,
+	})
 	if err != nil {
 		return fmt.Errorf("clickhouse insert: %w", err)
 	}

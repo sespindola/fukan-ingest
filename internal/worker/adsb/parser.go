@@ -15,8 +15,31 @@ type openSkyResponse struct {
 	States []json.RawMessage `json:"states"`
 }
 
+// openskyCategory maps the OpenSky integer category (index 16) to a label.
+// See: https://openskynetwork.github.io/opensky-api/rest.html#all-state-vectors
+var openskyCategory = [...]string{
+	0:  "none",
+	1:  "none",
+	2:  "light",
+	3:  "small",
+	4:  "large",
+	5:  "high_vortex_large",
+	6:  "heavy",
+	7:  "high_performance",
+	8:  "rotorcraft",
+	9:  "glider",
+	10: "lighter_than_air",
+	11: "parachutist",
+	12: "ultralight",
+	13: "reserved",
+	14: "uav",
+	15: "space",
+	16: "surface_emergency",
+	17: "surface_service",
+}
+
 // ParseStates parses an OpenSky /states/all response body into FukanEvents.
-// Aircraft that are on_ground or have null lat/lon are skipped.
+// Aircraft with null lat/lon are skipped.
 func ParseStates(body []byte, source string) ([]model.FukanEvent, error) {
 	var resp openSkyResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -53,6 +76,13 @@ func ParseStates(body []byte, source string) ([]model.FukanEvent, error) {
 			continue
 		}
 
+		// Index 1: callsign.
+		callsign, _ := state[1].(string)
+		callsign = strings.TrimSpace(callsign)
+
+		// Index 2: origin_country.
+		origin, _ := state[2].(string)
+
 		// Index 7: baro_altitude (meters).
 		alt, _ := toFloat64(state[7])
 
@@ -63,11 +93,23 @@ func ParseStates(body []byte, source string) ([]model.FukanEvent, error) {
 		// Index 10: true_track (degrees).
 		heading, _ := toFloat64(state[10])
 
+		// Index 11: vertical_rate (m/s).
+		verticalRate, _ := toFloat64(state[11])
+
 		// Index 14: squawk.
 		var metadata string
 		if squawk, ok := state[14].(string); ok && squawk != "" {
 			b, _ := json.Marshal(map[string]string{"squawk": squawk})
 			metadata = string(b)
+		}
+
+		// Index 16: category.
+		var category string
+		if catVal, ok := toFloat64(state[16]); ok {
+			idx := int(catVal)
+			if idx >= 0 && idx < len(openskyCategory) {
+				category = openskyCategory[idx]
+			}
 		}
 
 		h3cell, err := coord.ComputeH3(lat, lon)
@@ -76,17 +118,21 @@ func ParseStates(body []byte, source string) ([]model.FukanEvent, error) {
 		}
 
 		event := model.FukanEvent{
-			Timestamp: tsMillis,
-			AssetID:   strings.ToUpper(icao24),
-			AssetType: model.AssetAircraft,
-			Lat:       coord.ScaleLat(lat),
-			Lon:       coord.ScaleLon(lon),
-			Alt:       int32(alt),
-			Speed:     speedKnots,
-			Heading:   float32(heading),
-			H3Cell:    h3cell,
-			Source:    source,
-			Metadata:  metadata,
+			Timestamp:    tsMillis,
+			AssetID:      strings.ToUpper(icao24),
+			AssetType:    model.AssetAircraft,
+			Callsign:     callsign,
+			Origin:       origin,
+			Category:     category,
+			Lat:          coord.ScaleLat(lat),
+			Lon:          coord.ScaleLon(lon),
+			Alt:          int32(alt),
+			Speed:        speedKnots,
+			Heading:       float32(heading),
+			VerticalRate: float32(verticalRate),
+			H3Cell:       h3cell,
+			Source:        source,
+			Metadata:     metadata,
 		}
 
 		if err := model.Validate(event); err != nil {

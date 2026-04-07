@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
 	"github.com/nats-io/nats.go"
 	"github.com/sespindola/fukan-ingest/internal/clickhouse"
+	"github.com/sespindola/fukan-ingest/internal/config"
 	"github.com/sespindola/fukan-ingest/internal/model"
 	"github.com/sespindola/fukan-ingest/internal/redis"
 )
@@ -28,6 +30,7 @@ const (
 // MaxBatchSize events or MaxFlushLatency elapsed.
 type Batcher struct {
 	ch       *ch.Client
+	chCfg    config.ClickHouseConfig
 	redis    *redis.Publisher
 	buf      []model.FukanEvent
 	mu       sync.Mutex
@@ -36,9 +39,10 @@ type Batcher struct {
 	retryWg  sync.WaitGroup
 }
 
-func New(ch *ch.Client, redis *redis.Publisher) *Batcher {
+func New(ch *ch.Client, chCfg config.ClickHouseConfig, redis *redis.Publisher) *Batcher {
 	return &Batcher{
 		ch:       ch,
+		chCfg:    chCfg,
 		redis:    redis,
 		buf:      make([]model.FukanEvent, 0, MaxBatchSize),
 		retrySem: make(chan struct{}, MaxRetryBuffer),
@@ -115,13 +119,36 @@ func (b *Batcher) scheduleRetry(batch []model.FukanEvent) {
 	}()
 }
 
+func (b *Batcher) reconnect() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	newConn, err := clickhouse.Connect(ctx, b.chCfg)
+	if err != nil {
+		slog.Warn("clickhouse reconnect failed", "err", err)
+		return
+	}
+
+	b.mu.Lock()
+	old := b.ch
+	b.ch = newConn
+	b.mu.Unlock()
+
+	old.Close()
+	slog.Info("clickhouse reconnected")
+}
+
 func (b *Batcher) retryInsert(batch []model.FukanEvent) {
 	backoff := initialRetryBackoff
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		time.Sleep(backoff)
 
+		b.mu.Lock()
+		conn := b.ch
+		b.mu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := clickhouse.InsertBatch(ctx, b.ch, batch)
+		err := clickhouse.InsertBatch(ctx, conn, batch)
 		cancel()
 
 		if err == nil {
@@ -135,9 +162,18 @@ func (b *Batcher) retryInsert(batch []model.FukanEvent) {
 		}
 
 		slog.Warn("retry failed", "attempt", attempt, "err", err, "count", len(batch))
+
+		if isClientClosed(err) {
+			b.reconnect()
+		}
+
 		backoff = min(backoff*2, maxRetryBackoff)
 	}
 	slog.Error("all retries exhausted, dropping batch", "count", len(batch))
+}
+
+func isClientClosed(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "client is closed")
 }
 
 // DrainAndFlush flushes any remaining buffered events and waits for in-flight retries.
