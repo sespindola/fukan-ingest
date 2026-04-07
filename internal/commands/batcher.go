@@ -34,7 +34,7 @@ func newBatcherCmd() *cobra.Command {
 			}
 			defer redisPub.Close()
 
-			b := batcher.New(conn, redisPub)
+			b := batcher.New(conn, cfg.ClickHouse, redisPub)
 
 			nc, err := fukanNats.Connect(cfg.NATS.URL)
 			if err != nil {
