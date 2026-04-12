@@ -97,10 +97,9 @@ func ParseStates(body []byte, source string) ([]model.FukanEvent, error) {
 		verticalRate, _ := toFloat64(state[11])
 
 		// Index 14: squawk.
-		var metadata string
-		if squawk, ok := state[14].(string); ok && squawk != "" {
-			b, _ := json.Marshal(map[string]string{"squawk": squawk})
-			metadata = string(b)
+		var squawk string
+		if s, ok := state[14].(string); ok {
+			squawk = s
 		}
 
 		// Index 16: category.
@@ -132,7 +131,7 @@ func ParseStates(body []byte, source string) ([]model.FukanEvent, error) {
 			VerticalRate: float32(verticalRate),
 			H3Cell:       h3cell,
 			Source:        source,
-			Metadata:     metadata,
+			Squawk:       squawk,
 		}
 
 		if err := model.Validate(event); err != nil {

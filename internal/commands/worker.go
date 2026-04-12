@@ -14,6 +14,7 @@ import (
 	fukanSignal "github.com/sespindola/fukan-ingest/internal/signal"
 	"github.com/sespindola/fukan-ingest/internal/worker"
 	"github.com/sespindola/fukan-ingest/internal/worker/adsb"
+	"github.com/sespindola/fukan-ingest/internal/worker/ais"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
@@ -119,6 +120,12 @@ func newWorker(feedType string, ic config.IntegrationConfig, nc *nats.Conn) (wor
 			opts = append(opts, adsb.WithOAuth2(ic.ClientID, ic.ClientSecret, tokenURL))
 		}
 		return adsb.New(ic.APIURL, ic.Name, nc, opts...), nil
+	case "ais":
+		var opts []ais.Option
+		if ic.APIKey != "" {
+			opts = append(opts, ais.WithAPIKey(ic.APIKey))
+		}
+		return ais.New(ic.APIURL, ic.Name, nc, opts...), nil
 	default:
 		return nil, fmt.Errorf("unknown feed type: %s", feedType)
 	}

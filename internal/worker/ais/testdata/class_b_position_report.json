@@ -1,0 +1,36 @@
+{
+  "MessageType": "StandardClassBPositionReport",
+  "MetaData": {
+    "MMSI": 338123456,
+    "ShipName": "SAILING VESSEL",
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "time_utc": "2026-04-12T12:30:00Z"
+  },
+  "Message": {
+    "StandardClassBPositionReport": {
+      "MessageID": 18,
+      "RepeatIndicator": 0,
+      "UserID": 338123456,
+      "Valid": true,
+      "Spare1": 0,
+      "Sog": 6.2,
+      "PositionAccuracy": true,
+      "Longitude": -74.006,
+      "Latitude": 40.7128,
+      "Cog": 270.5,
+      "TrueHeading": 511,
+      "Timestamp": 15,
+      "Spare2": 0,
+      "ClassBUnit": true,
+      "ClassBDisplay": false,
+      "ClassBDsc": false,
+      "ClassBBand": true,
+      "ClassBMsg22": false,
+      "AssignedMode": false,
+      "Raim": false,
+      "CommunicationStateIsItdma": true,
+      "CommunicationState": 0
+    }
+  }
+}

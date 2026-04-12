@@ -1,0 +1,31 @@
+{
+  "MessageType": "PositionReport",
+  "MetaData": {
+    "MMSI": 211234560,
+    "ShipName": "EVER GIVEN",
+    "latitude": 31.5,
+    "longitude": 32.3,
+    "time_utc": "2026-04-12T10:00:00Z"
+  },
+  "Message": {
+    "PositionReport": {
+      "MessageID": 1,
+      "RepeatIndicator": 0,
+      "UserID": 211234560,
+      "Valid": true,
+      "NavigationalStatus": 0,
+      "RateOfTurn": 5.0,
+      "Sog": 12.5,
+      "PositionAccuracy": true,
+      "Longitude": 32.3,
+      "Latitude": 31.5,
+      "Cog": 125.7,
+      "TrueHeading": 127,
+      "Timestamp": 30,
+      "SpecialManoeuvreIndicator": 0,
+      "Spare": 0,
+      "Raim": false,
+      "CommunicationState": 0
+    }
+  }
+}

@@ -28,7 +28,7 @@ integrations:
     #   api_url: http://another-adsb-feed
     #   api_key: YOUR_API_KEY
     #   interval: 2
-  # ais:
-  #   - name: aisstream
-  #     api_url: wss://stream.aisstream.io/v0/stream
-  #     api_key: YOUR_KEY
+  ais:
+    - name: aisstream
+      api_url: wss://stream.aisstream.io/v0/stream
+      api_key: YOUR_AISSTREAM_API_KEY

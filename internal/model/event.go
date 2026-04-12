@@ -27,5 +27,16 @@ type FukanEvent struct {
 	VerticalRate float32   `json:"vr"`       // meters/second, positive = climbing
 	H3Cell       uint64    `json:"h3"`       // pre-computed H3 index at resolution 7
 	Source       string    `json:"src"`      // provider identifier (e.g. "adsb_exchange")
-	Metadata     string    `json:"meta"`     // JSON blob, type-specific (squawk, nav_status, etc.)
+	Squawk       string    `json:"squawk"`
+	NavStatus    string    `json:"nav_status"`
+	IMONumber    uint32    `json:"imo_number"`
+	ShipType     string    `json:"ship_type"`
+	Destination  string    `json:"destination"`
+	Draught      float32   `json:"draught"`
+	DimA         uint16    `json:"dim_a"`
+	DimB         uint16    `json:"dim_b"`
+	DimC         uint16    `json:"dim_c"`
+	DimD         uint16    `json:"dim_d"`
+	ETA          string    `json:"eta"`
+	RateOfTurn   float32   `json:"rate_of_turn"`
 }

@@ -75,9 +75,9 @@ func TestParseStates(t *testing.T) {
 		t.Error("H3Cell = 0, want non-zero")
 	}
 
-	// Squawk metadata.
-	if e.Metadata != `{"squawk":"7700"}` {
-		t.Errorf("Metadata = %q, want %q", e.Metadata, `{"squawk":"7700"}`)
+	// Squawk.
+	if e.Squawk != "7700" {
+		t.Errorf("Squawk = %q, want %q", e.Squawk, "7700")
 	}
 }
 
@@ -90,8 +90,8 @@ func TestParseStates_NoSquawk(t *testing.T) {
 		t.Fatalf("got %d events, want at least 2", len(events))
 	}
 	// Second event (index 3 in fixture) has no squawk.
-	if events[1].Metadata != "" {
-		t.Errorf("Metadata = %q, want empty", events[1].Metadata)
+	if events[1].Squawk != "" {
+		t.Errorf("Squawk = %q, want empty", events[1].Squawk)
 	}
 }
 
