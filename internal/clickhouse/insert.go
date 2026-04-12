@@ -35,15 +35,23 @@ func InsertBatch(ctx context.Context, conn *ch.Client, events []model.FukanEvent
 		colDimB         proto.ColUInt16
 		colDimC         proto.ColUInt16
 		colDimD         proto.ColUInt16
-		colETA          proto.ColStr
-		colRateOfTurn   proto.ColFloat32
+		colETA            proto.ColStr
+		colRateOfTurn     proto.ColFloat32
+		colInclination    proto.ColFloat32
+		colPeriodMinutes  proto.ColFloat32
+		colApogeeKm       proto.ColFloat32
+		colPerigeeKm      proto.ColFloat32
 	)
+	colTLEEpoch := new(proto.ColDateTime64).WithPrecision(proto.PrecisionMilli)
 	colAssetType := proto.NewLowCardinality[string](&proto.ColStr{})
 	colOrigin := proto.NewLowCardinality[string](&proto.ColStr{})
 	colCategory := proto.NewLowCardinality[string](&proto.ColStr{})
 	colSource := proto.NewLowCardinality[string](&proto.ColStr{})
 	colNavStatus := proto.NewLowCardinality[string](&proto.ColStr{})
 	colShipType := proto.NewLowCardinality[string](&proto.ColStr{})
+	colOrbitRegime := proto.NewLowCardinality[string](&proto.ColStr{})
+	colConfidence := proto.NewLowCardinality[string](&proto.ColStr{})
+	colSatStatus := proto.NewLowCardinality[string](&proto.ColStr{})
 
 	for _, e := range events {
 		colEventTime.Append(time.UnixMilli(e.Timestamp))
@@ -72,6 +80,14 @@ func InsertBatch(ctx context.Context, conn *ch.Client, events []model.FukanEvent
 		colDimD.Append(e.DimD)
 		colETA.Append(e.ETA)
 		colRateOfTurn.Append(e.RateOfTurn)
+		colOrbitRegime.Append(e.OrbitRegime)
+		colConfidence.Append(e.Confidence)
+		colTLEEpoch.Append(time.UnixMilli(e.TLEEpoch))
+		colInclination.Append(e.Inclination)
+		colPeriodMinutes.Append(e.PeriodMinutes)
+		colApogeeKm.Append(e.ApogeeKm)
+		colPerigeeKm.Append(e.PerigeeKm)
+		colSatStatus.Append(e.SatStatus)
 	}
 
 	input := proto.Input{
@@ -101,6 +117,14 @@ func InsertBatch(ctx context.Context, conn *ch.Client, events []model.FukanEvent
 		{Name: "dim_d", Data: &colDimD},
 		{Name: "eta", Data: &colETA},
 		{Name: "rate_of_turn", Data: &colRateOfTurn},
+		{Name: "orbit_regime", Data: colOrbitRegime},
+		{Name: "confidence", Data: colConfidence},
+		{Name: "tle_epoch", Data: colTLEEpoch},
+		{Name: "inclination", Data: &colInclination},
+		{Name: "period_minutes", Data: &colPeriodMinutes},
+		{Name: "apogee_km", Data: &colApogeeKm},
+		{Name: "perigee_km", Data: &colPerigeeKm},
+		{Name: "sat_status", Data: colSatStatus},
 	}
 
 	err := conn.Do(ctx, ch.Query{

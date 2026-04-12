@@ -15,8 +15,8 @@ import (
 	"github.com/sespindola/fukan-ingest/internal/worker"
 	"github.com/sespindola/fukan-ingest/internal/worker/adsb"
 	"github.com/sespindola/fukan-ingest/internal/worker/ais"
+	tleWorker "github.com/sespindola/fukan-ingest/internal/worker/tle"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -30,7 +30,7 @@ func newWorkerCmd() *cobra.Command {
 			return runWorker(cmd.Context(), configFrom(cmd), workerType)
 		},
 	}
-	cmd.Flags().StringVar(&workerType, "type", "", "feed type (e.g. adsb)")
+	cmd.Flags().StringVar(&workerType, "type", "", "feed type: adsb, ais, tle")
 	_ = cmd.MarkFlagRequired("type")
 	return cmd
 }
@@ -52,18 +52,6 @@ func runWorker(ctx context.Context, cfg *config.Config, feedType string) error {
 		}
 	}
 
-	// Inject OpenSky OAuth2 creds from env vars if not set in YAML.
-	openSkyClientID := viper.GetString("opensky.client_id")
-	openSkyClientSecret := viper.GetString("opensky.client_secret")
-	for i := range integrations {
-		if integrations[i].ClientID == "" && openSkyClientID != "" {
-			integrations[i].ClientID = openSkyClientID
-		}
-		if integrations[i].ClientSecret == "" && openSkyClientSecret != "" {
-			integrations[i].ClientSecret = openSkyClientSecret
-		}
-	}
-
 	if len(integrations) == 0 {
 		return fmt.Errorf("no integrations configured for feed type %q", feedType)
 	}
@@ -79,16 +67,26 @@ func runWorker(ctx context.Context, cfg *config.Config, feedType string) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	for _, ic := range integrations {
-		w, err := newWorker(feedType, ic, nc)
-		if err != nil {
-			cancel()
-			return err
-		}
+	// TLE workers handle multiple sources internally (CelesTrak + classified).
+	// Other feed types spawn one worker per integration.
+	if feedType == "tle" {
+		w := newTLEWorker(integrations, nc)
 		slog.Info("starting worker", "worker", w.Name())
 		g.Go(func() error {
 			return w.Run(gctx)
 		})
+	} else {
+		for _, ic := range integrations {
+			w, err := newWorker(feedType, ic, nc)
+			if err != nil {
+				cancel()
+				return err
+			}
+			slog.Info("starting worker", "worker", w.Name())
+			g.Go(func() error {
+				return w.Run(gctx)
+			})
+		}
 	}
 
 	if err := g.Wait(); err != nil {
@@ -129,4 +127,22 @@ func newWorker(feedType string, ic config.IntegrationConfig, nc *nats.Conn) (wor
 	default:
 		return nil, fmt.Errorf("unknown feed type: %s", feedType)
 	}
+}
+
+func newTLEWorker(integrations []config.IntegrationConfig, nc *nats.Conn) worker.Worker {
+	// Find the primary (CelesTrak) and optional classified integration.
+	var celestrakURL, celestrakName, classifiedURL string
+	for _, ic := range integrations {
+		if ic.Name == "classfd" {
+			classifiedURL = ic.APIURL
+		} else {
+			celestrakURL = ic.APIURL
+			celestrakName = ic.Name
+		}
+	}
+	var opts []tleWorker.Option
+	if classifiedURL != "" {
+		opts = append(opts, tleWorker.WithClassifiedURL(classifiedURL))
+	}
+	return tleWorker.New(celestrakURL, celestrakName, nc, opts...)
 }

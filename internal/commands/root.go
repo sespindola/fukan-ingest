@@ -80,12 +80,6 @@ func loadConfig(cfgFile string) (*config.Config, error) {
 	_ = viper.BindEnv("clickhouse.password", "CLICKHOUSE_PASSWORD")
 	_ = viper.BindEnv("redis.url", "REDIS_URL")
 
-	// OpenSky config: OAuth2 + aircraft database CSV URL.
-	viper.SetDefault("opensky.csv_url", "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv")
-	_ = viper.BindEnv("opensky.client_id", "OPENSKY_CLIENT_ID")
-	_ = viper.BindEnv("opensky.client_secret", "OPENSKY_CLIENT_SECRET")
-	_ = viper.BindEnv("opensky.csv_url", "OPENSKY_CSV_URL")
-
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			// Only fail if a config file was explicitly specified.

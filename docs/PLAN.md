@@ -93,23 +93,28 @@
 - ~~Wired into `worker --type ais` + `batcher --type vessel` (batcher already generic)~~
 - ~~`config.example.yaml` updated with AIS integration section~~
 
-## Phase 4 — Satellite Feed (TLE Orbits)
+## Phase 3.5 — Satellite Schema (Migration 000005) (2026-04-12)
 
-- [ ] TLE fetcher: daily HTTP pull from CelesTrak — primary catalog (`internal/worker/tle/fetcher.go`)
-- [ ] planet4589.org fetcher: daily HTTP pull of JSR Satellite Catalog for classified/military objects not in CelesTrak (`internal/worker/tle/planet4589.go`)
-- [ ] JSR catalog parser: handle planet4589.org's TSV format (separate from standard TLE parser)
-- [ ] SGP4 propagator with regime-aware intervals (`internal/worker/tle/propagator.go`):
-  - LEO (< 2,000 km): every 10s
-  - MEO (2,000–35,786 km): every 30s
-  - GEO (~35,786 km): every 60–300s
-  - HEO (elliptical): every 10s
-- [ ] Orbit regime classification: derive from orbital period/altitude, enrich metadata `{"regime":"leo"}`
-- [ ] Confidence tagging: planet4589.org objects get `{"confidence":"community_derived"}`
-- [ ] Maneuver detection: compare daily mean motion / inclination deltas → metadata `{"status":"maneuvering"}`
-- [ ] Decay detection: BSTAR drag + perigee < 150km → metadata `{"status":"decaying"}`
-- [ ] `cmd/propagator/main.go` entrypoint
-- [ ] Env vars: `CELESTRAK_URL`, `PLANET4589_URL`
-- [ ] Tests with known TLE fixtures + planet4589.org format fixtures
+- ~~Migration `000005_add_satellite_fields`: adds `orbit_regime`, `confidence`, `tle_epoch`, `inclination`, `period_minutes`, `apogee_km`, `perigee_km` columns to `telemetry_raw`~~
+- ~~7 new `argMax` state columns on `telemetry_latest`; MV + flat view recreated~~
+- ~~`satellite_meta` reference table (ReplacingMergeTree, keyed by norad_cat_id) for GCAT enrichment data~~
+- ~~`FukanEvent` struct extended with satellite fields; `InsertBatch` updated with new typed columns~~
+
+## Phase 4 — Satellite Feed (TLE Orbits) (2026-04-12)
+
+- ~~Three data sources: CelesTrak GP JSON (~15k active), McCants/Molczan classified TLEs (~500), GCAT satellite catalog (metadata enrichment)~~
+- ~~SGP4 propagation via `github.com/akhenakh/sgp4` (Apache 2.0, OMM JSON support, `FindPositionAtTime()` + `ToGeodetic()`)~~
+- ~~Single `worker --type tle` manages fetching (2h CelesTrak, 6h classified) + continuous propagation~~
+- ~~Regime-aware propagation intervals: LEO 30s, MEO 60s, GEO 120s, HEO 30s (~455 events/sec total)~~
+- ~~Orbit regime classification from semi-major axis (Kepler's third law from mean motion)~~
+- ~~Confidence tagging: `official` (CelesTrak), `community_derived` (classified TLEs), `stale` (epoch > 14d LEO / 30d MEO+GEO)~~
+- ~~`refresh --target satellites` loads GCAT `satcat.tsv` into `satellite_meta` table (TSV parser, 50k batch inserts)~~
+- ~~12 tests: regime classification (LEO/MEO/GEO/HEO), orbital params, fetcher (HTTP mock + rate limit), TLE batch parsing, SGP4 propagation (ISS position/altitude), staleness detection, classified source tagging~~
+- ~~Wired into `worker --type tle` + `batcher --type satellite`; `config.example.yaml` updated~~
+- ~~Maneuver detection: compares mean motion (>0.01 rev/day delta) and inclination (>0.1° delta) between TLE fetch cycles; tags `sat_status = "maneuvering"`~~
+- ~~Decay detection: checks perigee < 150 km or BSTAR > 0.01 at propagation time; tags `sat_status = "decaying"`~~
+- ~~Migration `000006_add_sat_status`: adds `sat_status` LowCardinality(String) column to `telemetry_raw` + argMax state to `telemetry_latest`; recreates MV + flat view~~
+- ~~5 new tests: maneuver detection (no-change, period shift, plane change), decay detection (healthy, low perigee), propagateOne with decaying/maneuvering status~~
 
 ## Phase 5 — BGP Feed (Internet Routing)
 

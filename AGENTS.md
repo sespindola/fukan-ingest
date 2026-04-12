@@ -47,6 +47,7 @@ External feed (ADS-B, AIS, TLE, BGP, News)
 - ❌ Storing PII from social/news feeds → Aggregate data only
 - ❌ Storing full article text from news → Headline + source URL + sentiment only
 - ❌ Processing satellite imagery → Orbital position data only (TLE → SGP4)
+- ❌ JSON blobs in String columns for structured data → Typed ClickHouse columns (ClickHouse is columnar; sparse columns cost nothing, `JSONExtract()` on String is expensive at scale)
 
 ### Data Ownership Rule
 
@@ -950,6 +951,7 @@ MAXMIND_DB_PATH=/data/GeoLite2-ASN.mmdb
 13. **No broker-level delivery guarantees** — NATS core is best-effort
 14. **No ignoring context cancellation** — graceful shutdown on SIGTERM
 15. **No Hetzner Cloud Volumes for ClickHouse** — local NVMe only
+16. **No JSON blobs in String columns** — use typed ClickHouse columns for all structured data; columnar storage makes sparse columns free
 
 ---
 
