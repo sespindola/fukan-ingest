@@ -10,20 +10,16 @@ clickhouse:
 redis:
   url: redis://localhost:6379/0
 
-# OpenSky Network credentials (shared by worker + refresh command).
-# Register at https://opensky-network.org/my-opensky/account for OAuth2 client credentials.
-# Can also be set via OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET env vars.
-opensky:
-  client_id: your-client-id
-  client_secret: your-client-secret
-  # csv_url defaults to https://opensky-network.org/datasets/metadata/aircraftDatabase.csv
-  # csv_url: https://opensky-network.org/datasets/metadata/aircraftDatabase.csv
-
 integrations:
   adsb:
     - name: opensky
       api_url: https://opensky-network.org/api/states/all
       interval: 10  # seconds (10s anon / 5s authenticated)
+      # OpenSky OAuth2 credentials (optional, for authenticated access).
+      # Register at https://opensky-network.org/my-opensky/account
+      # Also used by `refresh --target airlines` for CSV download.
+      client_id: your-client-id
+      client_secret: your-client-secret
     # - name: adsb_exchange
     #   api_url: http://another-adsb-feed
     #   api_key: YOUR_API_KEY
@@ -32,3 +28,10 @@ integrations:
     - name: aisstream
       api_url: wss://stream.aisstream.io/v0/stream
       api_key: YOUR_AISSTREAM_API_KEY
+  tle:
+    - name: celestrak
+      api_url: https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json
+      interval: 7200  # 2 hours
+    - name: classfd
+      api_url: https://mmccants.org/tles/classfd.zip
+      interval: 21600  # 6 hours

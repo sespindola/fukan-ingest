@@ -7,6 +7,7 @@ toolchain go1.24.3
 require (
 	github.com/ClickHouse/ch-go v0.71.0
 	github.com/ClickHouse/clickhouse-go/v2 v2.44.0
+	github.com/akhenakh/sgp4 v0.0.0-20260314155803-8ee03fc877eb
 	github.com/coder/websocket v1.8.14
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/nats-io/nats.go v1.49.0

@@ -37,6 +37,14 @@ type FukanEvent struct {
 	DimB         uint16    `json:"dim_b"`
 	DimC         uint16    `json:"dim_c"`
 	DimD         uint16    `json:"dim_d"`
-	ETA          string    `json:"eta"`
-	RateOfTurn   float32   `json:"rate_of_turn"`
+	ETA           string    `json:"eta"`
+	RateOfTurn    float32   `json:"rate_of_turn"`
+	OrbitRegime   string    `json:"orbit_regime"`
+	Confidence    string    `json:"confidence"`
+	TLEEpoch      int64     `json:"tle_epoch"`
+	Inclination   float32   `json:"inclination"`
+	PeriodMinutes float32   `json:"period_minutes"`
+	ApogeeKm      float32   `json:"apogee_km"`
+	PerigeeKm     float32   `json:"perigee_km"`
+	SatStatus     string    `json:"sat_status"`
 }

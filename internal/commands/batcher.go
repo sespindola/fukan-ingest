@@ -61,6 +61,6 @@ func newBatcherCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&batcherType, "type", "aircraft", "asset type (e.g. aircraft)")
+	cmd.Flags().StringVar(&batcherType, "type", "aircraft", "asset type: aircraft, vessel, satellite")
 	return cmd
 }

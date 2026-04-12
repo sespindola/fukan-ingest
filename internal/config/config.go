@@ -7,7 +7,6 @@ type Config struct {
 	NATS         NATSConfig                     `mapstructure:"nats"`
 	ClickHouse   ClickHouseConfig               `mapstructure:"clickhouse"`
 	Redis        RedisConfig                    `mapstructure:"redis"`
-	OpenSky      OpenSkyConfig                  `mapstructure:"opensky"`
 	Integrations map[string][]IntegrationConfig `mapstructure:"integrations"`
 }
 
@@ -24,12 +23,6 @@ type ClickHouseConfig struct {
 
 type RedisConfig struct {
 	URL string `mapstructure:"url"`
-}
-
-type OpenSkyConfig struct {
-	ClientID     string `mapstructure:"client_id"`
-	ClientSecret string `mapstructure:"client_secret"`
-	CSVURL       string `mapstructure:"csv_url"`
 }
 
 type IntegrationConfig struct {
