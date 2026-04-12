@@ -2,7 +2,12 @@
 
 > AI coding assistant context file for the Go ETL/ingestion pipeline.
 > Read fully before generating any code.
-> Last updated: 2026-03-05
+> Last updated: 2026-04-12
+>
+> For the most granular (and continuously updated) reference on the
+> pipeline's current shape, see `docs/ARCHITECTURE.md` and `docs/PLAN.md`.
+> This file captures the invariants, non-goals, and narrative explanation
+> of *why* things are the way they are — those docs capture the *what*.
 
 ---
 
@@ -148,18 +153,55 @@ const (
 
 // FukanEvent is the canonical normalized event.
 // Every ETL worker MUST produce this struct. No exceptions.
+//
+// The struct is DENORMALIZED — prior versions used a single `Metadata string`
+// JSON blob for type-specific fields, but migration 000004 replaced that with
+// typed ClickHouse columns because JSONExtract() on a String column is
+// expensive at scale and sparse columnar storage is free. Add new fields
+// here, add a matching typed column to telemetry_raw via a new migration,
+// add the argMax state + flat-view projection to telemetry_latest, and
+// update the Go insert batch columns in internal/clickhouse/insert.go.
 type FukanEvent struct {
-    Timestamp int64     `json:"ts"`    // Unix epoch milliseconds
-    AssetID   string    `json:"id"`    // ICAO hex, MMSI, NORAD ID, ASN, or event hash
-    AssetType AssetType `json:"type"`  // aircraft, vessel, satellite, bgp_node, news
-    Lat       int32     `json:"lat"`   // latitude * 10_000_000
-    Lon       int32     `json:"lon"`   // longitude * 10_000_000
-    Alt       int32     `json:"alt"`   // meters above sea level (0 for surface/network)
-    Speed     float32   `json:"spd"`   // knots (aircraft/vessel) or 0
-    Heading   float32   `json:"hdg"`   // degrees (0-360) or 0
-    H3Cell    uint64    `json:"h3"`    // pre-computed H3 index at resolution 7
-    Source    string    `json:"src"`   // provider identifier (e.g. "adsb_exchange")
-    Metadata  string    `json:"meta"`  // JSON blob, type-specific (squawk, nav_status, etc.)
+    Timestamp    int64     `json:"ts"`       // Unix epoch milliseconds
+    AssetID      string    `json:"id"`       // ICAO hex, MMSI, NORAD ID, ASN, or event hash
+    AssetType    AssetType `json:"type"`     // aircraft, vessel, satellite, bgp_node, news
+    Callsign     string    `json:"callsign"` // flight callsign, vessel name, satellite designator
+    Origin       string    `json:"origin"`   // origin country, city, airport, port
+    Category     string    `json:"cat"`      // wake class, vessel type, satellite regime
+    Lat          int32     `json:"lat"`      // latitude * 10_000_000
+    Lon          int32     `json:"lon"`      // longitude * 10_000_000
+    Alt          int32     `json:"alt"`      // meters above sea level (0 for surface/network)
+    Speed        float32   `json:"spd"`      // knots (aircraft/vessel) or 0
+    Heading      float32   `json:"hdg"`      // degrees (0-360) or 0
+    VerticalRate float32   `json:"vr"`       // m/s, positive = climbing (aircraft)
+    H3Cell       uint64    `json:"h3"`       // pre-computed H3 index at resolution 7
+    Source       string    `json:"src"`      // provider identifier (e.g. "adsb_exchange")
+
+    // Aircraft-specific
+    Squawk string `json:"squawk"` // transponder squawk code
+
+    // Vessel-specific (AIS)
+    NavStatus   string  `json:"nav_status"`   // under_way, at_anchor, moored, ...
+    IMONumber   uint32  `json:"imo_number"`
+    ShipType    string  `json:"ship_type"`    // cargo, tanker, passenger, ...
+    Destination string  `json:"destination"`  // reported destination port
+    Draught     float32 `json:"draught"`      // meters
+    DimA        uint16  `json:"dim_a"`        // meters, bow → AIS reference
+    DimB        uint16  `json:"dim_b"`        // meters, stern → AIS reference
+    DimC        uint16  `json:"dim_c"`        // meters, port → AIS reference
+    DimD        uint16  `json:"dim_d"`        // meters, starboard → AIS reference
+    ETA         string  `json:"eta"`          // estimated time of arrival (AIS format)
+    RateOfTurn  float32 `json:"rate_of_turn"` // degrees/minute
+
+    // Satellite-specific (TLE-derived, set by the TLE worker)
+    OrbitRegime   string  `json:"orbit_regime"`   // 'leo' | 'meo' | 'geo' | 'heo'
+    Confidence    string  `json:"confidence"`     // 'official' | 'community_derived' | 'stale'
+    TLEEpoch      int64   `json:"tle_epoch"`      // Unix ms of the TLE used to propagate
+    Inclination   float32 `json:"inclination"`    // degrees
+    PeriodMinutes float32 `json:"period_minutes"`
+    ApogeeKm      float32 `json:"apogee_km"`
+    PerigeeKm     float32 `json:"perigee_km"`
+    SatStatus     string  `json:"sat_status"`     // 'maneuvering' | 'decaying' | ''
 }
 ```
 
@@ -196,54 +238,66 @@ event.H3Cell = uint64(cell)
 ```
 fukan-ingest/
 ├── cmd/
-│   └── fukan-ingest/            # Unified CLI binary (Cobra)
-│       ├── main.go              # Entry point — executes rootCmd
-│       ├── root.go              # Root command, Viper config init
-│       ├── version.go           # `fukan-ingest version` subcommand
-│       ├── worker.go            # `fukan-ingest worker --type <feed>` subcommand
-│       └── batcher.go           # `fukan-ingest batcher --type <asset>` subcommand
+│   └── fukan-ingest/            # Thin entrypoint — ~15 lines, calls commands.Execute()
+│       └── main.go
 ├── config.example.yaml          # Reference YAML config (Viper)
 ├── internal/
+│   ├── commands/                # All subcommand logic (moved here in Phase 2.6)
+│   │   ├── root.go              # Cobra root command, config loading via context
+│   │   ├── worker.go            # `worker --type <feed>` subcommand
+│   │   ├── batcher.go           # `batcher --type <asset>` subcommand
+│   │   ├── refresh.go           # `refresh --target <target>` subcommand
+│   │   ├── migrate.go           # `migrate up|down|version` subcommand
+│   │   ├── version.go           # `version` subcommand
+│   │   └── migrations/          # Embedded SQL migration files (golang-migrate)
+│   │       ├── 000001_create_telemetry_tables.{up,down}.sql
+│   │       ├── 000002_create_aircraft_meta.{up,down}.sql
+│   │       ├── 000003_add_telemetry_fields.{up,down}.sql
+│   │       ├── 000004_denormalize_metadata.{up,down}.sql
+│   │       ├── 000005_add_satellite_fields.{up,down}.sql
+│   │       └── 000006_add_sat_status.{up,down}.sql
 │   ├── config/
-│   │   └── config.go           # Typed config structs (mapstructure tags for Viper)
+│   │   └── config.go            # Typed config structs (mapstructure tags for Viper)
 │   ├── model/
-│   │   └── event.go            # FukanEvent struct (canonical schema)
+│   │   ├── event.go             # FukanEvent struct (canonical schema)
+│   │   └── validate.go          # Event validation rules
+│   ├── coord/
+│   │   └── coord.go             # ScaleLat/ScaleLon/ComputeH3
+│   ├── nats/
+│   │   └── nats.go              # Connect() + PublishJSON() free functions
+│   │                            # (wrapper types deleted in Phase 2.6)
+│   ├── clickhouse/
+│   │   ├── clickhouse.go        # Connect() free function
+│   │   └── insert.go            # InsertBatch() columnar insert
+│   ├── redis/
+│   │   └── publisher.go         # AnyCable envelope publisher (H3 res 2–7 fan-out)
+│   ├── oauth2/
+│   │   └── token.go             # OAuth2 client credentials (OpenSky)
+│   ├── signal/
+│   │   └── signal.go            # NotifyCtx() shared signal handling
+│   ├── refresh/
+│   │   ├── aircraft.go          # OpenSky aircraft DB CSV → aircraft_meta
+│   │   ├── satellite.go         # GCAT satcat.tsv → satellite_meta
+│   │   └── discover.go          # Refresh target discovery
 │   ├── worker/
+│   │   ├── worker.go            # Worker interface + RunWithReconnect
 │   │   ├── adsb/
-│   │   │   ├── worker.go       # ADS-B feed consumer
-│   │   │   ├── parser.go       # Raw → FukanEvent normalization
+│   │   │   ├── worker.go        # ADS-B HTTP polling worker
+│   │   │   ├── parser.go        # OpenSky JSON → FukanEvent
 │   │   │   └── parser_test.go
 │   │   ├── ais/
-│   │   │   ├── worker.go       # AIS WebSocket consumer
-│   │   │   ├── parser.go
+│   │   │   ├── worker.go        # AIS WebSocket consumer (aisstream.io)
+│   │   │   ├── parser.go        # Position + static messages → FukanEvent
 │   │   │   └── parser_test.go
-│   │   ├── tle/
-│   │   │   ├── fetcher.go      # CelesTrak TLE downloader
-│   │   │   ├── propagator.go   # SGP4 → lat/lon/alt
-│   │   │   └── propagator_test.go
-│   │   ├── bgp/
-│   │   │   ├── worker.go       # BGPStream consumer
-│   │   │   ├── parser.go
-│   │   │   ├── geoip.go        # ASN/prefix → coordinates via MaxMind
-│   │   │   └── parser_test.go
-│   │   └── news/
-│   │       ├── worker.go       # GDELT poller
-│   │       ├── parser.go
-│   │       └── parser_test.go
-│   ├── batcher/
-│   │   ├── batcher.go          # NATS consumer → ClickHouse batch inserter
-│   │   ├── batcher_test.go
-│   │   ├── dedup.go            # Time-windowed hashmap dedup (v2)
-│   │   └── dedup_test.go
-│   ├── clickhouse/
-│   │   ├── client.go           # ch-go native protocol wrapper
-│   │   ├── schema.go           # DDL for table creation / migrations
-│   │   └── insert.go           # Batch insert logic
-│   ├── nats/
-│   │   ├── publisher.go        # NATS core publisher wrapper
-│   │   └── consumer.go         # NATS core subscriber wrapper
-│   └── redis/
-│       └── publisher.go        # Pub/sub publisher for live streaming
+│   │   └── tle/
+│   │       ├── worker.go        # CelesTrak + classified TLE fetch + SGP4 propagation
+│   │       ├── fetcher.go       # OMM JSON downloader
+│   │       ├── regime.go        # Orbit regime classification + OrbitalParams
+│   │       ├── regime_test.go
+│   │       ├── fetcher_test.go
+│   │       └── propagator_test.go
+│   └── batcher/
+│       └── batcher.go           # Dual-path: ClickHouse flush + broadcastLoop goroutine
 ├── deploy/
 │   ├── k8s/                    # Kubernetes manifests
 │   │   ├── worker-deployment.yaml
@@ -304,80 +358,141 @@ Operational note: provision disk for JetStream and monitor stream size/retention
 
 ## Batcher Logic
 
-### Flush Strategy
+The batcher runs two independent pipelines sharing a single NATS message
+handler. Each incoming event is (1) validated, (2) enqueued on a bounded
+broadcast channel for live streaming, and (3) appended to the ClickHouse
+buffer for persistence. The two paths are decoupled so live subscribers see
+updates within ~50 ms regardless of the ClickHouse buffer state, and neither
+path spawns a goroutine per event.
+
+### ClickHouse path — dual-threshold flush to `telemetry_raw`
+
+| Threshold | Value | Behavior |
+|---|---|---|
+| Size | `MaxBatchSize = 10_000` events | Immediate flush |
+| Time | `MaxFlushLatency = 2s` AfterFunc | Flush if non-empty |
+| Retry | Exponential, 100ms → 5s, 5 attempts | Bounded to 10 concurrent via `retrySem` |
+
+`client is closed` errors trigger an in-place reconnect of the ClickHouse
+client before the retry proceeds. On exhausted retries the batch is dropped
+with an error log — NATS core does not persist messages, so there is no
+redelivery.
+
+### Broadcast path — dedicated `broadcastLoop()` goroutine
+
+Spawned in `New()` and fed by `broadcastCh`, a bounded channel:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `broadcastBufferSize` | 50,000 events | Channel capacity; overflow drops with warning |
+| `broadcastBatchSize` | 500 events | Flush trigger (size) |
+| `broadcastFlushInterval` | 50 ms | Flush trigger (time) |
+| `broadcastPublishTimeout` | 5 s | Per-pipeline-Exec context deadline |
+
+Only one Redis pipeline `Exec` is in flight at a time (single broadcaster),
+so the Redis connection pool sees a small, steady workload under burst.
+Broadcast-channel overflow drops events with a warning — broadcasts are
+non-critical and ClickHouse is the source of truth for persistence.
+
+### Shutdown sequence — `DrainAndFlush()`
+
+1. Flush the ClickHouse buffer synchronously under the mutex.
+2. Wait for all in-flight ClickHouse retry goroutines (`retryWg.Wait()`).
+3. Close `broadcastCh` so the broadcaster drains any remainder and returns.
+4. Block on `broadcastDone` before the caller closes the Redis client.
 
 ```go
-// internal/batcher/batcher.go
-
-const (
-    MaxBatchSize    = 10_000        // rows per ClickHouse insert
-    MaxFlushLatency = 2 * time.Second // max time before forced flush
-)
-
-// Batcher accumulates events and flushes on whichever threshold hits first.
-// With NATS core there are no ACKs; messages are in-memory and transient.
+// internal/batcher/batcher.go — shape
 type Batcher struct {
-    buffer []model.FukanEvent
-    mu     sync.Mutex
-    ch     *clickhouse.Client
-    redis  *redis.Publisher
-    timer  *time.Timer
+    ch            *ch.Client           // bare ch-go client, no wrapper
+    chCfg         config.ClickHouseConfig
+    redis         *redis.Publisher
+    buf           []model.FukanEvent
+    mu            sync.Mutex
+    timer         *time.Timer
+    retrySem      chan struct{}
+    retryWg       sync.WaitGroup
+    broadcastCh   chan model.FukanEvent
+    broadcastDone chan struct{}
 }
 
-func (b *Batcher) Add(event model.FukanEvent) {
+func (b *Batcher) HandleMsg(msg *nats.Msg) {
+    var event model.FukanEvent
+    if err := json.Unmarshal(msg.Data, &event); err != nil { return }
+    if err := model.Validate(event); err != nil { return }
+
+    // Broadcast path — non-blocking enqueue, drop on overflow
+    select {
+    case b.broadcastCh <- event:
+    default:
+        slog.Warn("broadcast buffer full, dropping event", "asset_id", event.AssetID)
+    }
+
+    // ClickHouse path — buffer + size/time flush
     b.mu.Lock()
     defer b.mu.Unlock()
-
-    b.buffer = append(b.buffer, event)
-
-    if len(b.buffer) >= MaxBatchSize {
-        b.flush()
+    b.buf = append(b.buf, event)
+    if len(b.buf) >= MaxBatchSize {
+        b.flushLocked()
+    } else if b.timer == nil {
+        b.timer = time.AfterFunc(MaxFlushLatency, func() {
+            b.mu.Lock()
+            defer b.mu.Unlock()
+            b.flushLocked()
+        })
     }
-}
-
-func (b *Batcher) flush() {
-    if len(b.buffer) == 0 {
-        return
-    }
-
-    batch := b.buffer
-    b.buffer = make([]model.FukanEvent, 0, MaxBatchSize)
-
-    // 1. Insert into ClickHouse (native protocol, columnar batch)
-    if err := b.ch.InsertBatch(batch); err != nil {
-        // Retry in-process with backoff; NATS core does not persist messages.
-        log.Error("clickhouse insert failed", "err", err, "count", len(batch))
-        return
-    }
-
-    // 2. Publish to Redis for live streaming (grouped by H3 cell)
-    if err := b.redis.PublishBatch(batch); err != nil {
-        // Log but don't block — Redis failure is non-fatal for persistence
-        log.Warn("redis publish failed", "err", err)
-    }
-
-    // 3. No ACK step with NATS core
 }
 ```
 
-### Redis Publishing Pattern
+### Redis Publishing Pattern (AnyCable envelope)
+
+The publisher broadcasts to **anycable-go** on the fixed Redis channel
+`__anycable__` (anycable-go's default for `broadcast_adapters = ["redis"]`).
+Each event is wrapped in an `anycableEnvelope` matching what anycable-go
+relays straight to the client's ActionCable subscription:
 
 ```go
-// internal/redis/publisher.go
+type anycableEnvelope struct {
+    Stream string `json:"stream"` // "telemetry:<h3_hex>"
+    Data   string `json:"data"`   // JSON-encoded FukanEvent
+}
+```
 
-// Publish events grouped by H3 cell so AnyCable can fan out per viewport.
-// Redis channel: "telemetry:{h3_cell}"
-func (p *Publisher) PublishBatch(events []model.FukanEvent) error {
+Each event fans out across H3 resolutions **2–7** so a browser zoomed to
+continental view (res 3) and one zoomed to ground level (res 7) both
+receive matching broadcasts without requiring server-side child expansion
+on every subscribe. Cell ids are encoded via h3-go `Cell.String()` so they
+match h3-js `polygonToCells()` output in the browser.
+
+```go
+// internal/redis/publisher.go — core loop
+var broadcastResolutions = []int{2, 3, 4, 5, 6, 7}
+
+func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent) error {
     pipe := p.client.Pipeline()
     for _, e := range events {
-        channel := fmt.Sprintf("telemetry:%d", e.H3Cell)
         data, _ := json.Marshal(e)
-        pipe.Publish(context.Background(), channel, data)
+        cell := h3.Cell(e.H3Cell)
+        for _, res := range broadcastResolutions {
+            streamCell := cell
+            if res != 7 {
+                parent, _ := cell.Parent(res)
+                streamCell = parent
+            }
+            envelope, _ := json.Marshal(anycableEnvelope{
+                Stream: "telemetry:" + streamCell.String(),
+                Data:   string(data),
+            })
+            pipe.Publish(ctx, "__anycable__", envelope)
+        }
     }
-    _, err := pipe.Exec(context.Background())
+    _, err := pipe.Exec(ctx)
     return err
 }
 ```
+
+Called exclusively from `batcher.broadcastLoop()` — never per-event, never
+from multiple goroutines concurrently.
 
 ---
 
@@ -437,109 +552,156 @@ func (d *DedupWindow) Sweep() {
 
 ## Data Feed Specifications
 
-### ADS-B (Aircraft)
+**Field routing note:** all feed-specific fields below go into *typed
+`FukanEvent` fields and typed ClickHouse columns*, not into the removed
+`Metadata` JSON blob. See `internal/model/event.go` for the full canonical
+field list.
+
+### ADS-B (Aircraft) — IMPLEMENTED
 
 | Source field    | FukanEvent field | Transformation                          |
 |-----------------|---------------------|-----------------------------------------|
 | `hex` / `icao`  | `AssetID`           | Uppercase hex string                    |
+| `callsign`      | `Callsign`          | Trimmed string                          |
 | `lat`           | `Lat`               | `int32(lat * 10_000_000)`              |
 | `lon`           | `Lon`               | `int32(lon * 10_000_000)`              |
 | `alt_baro`      | `Alt`               | Feet → meters: `int32(alt * 0.3048)`   |
 | `gs`            | `Speed`             | Ground speed in knots (keep as-is)      |
 | `track`         | `Heading`           | Degrees (keep as-is)                    |
-| `squawk`        | `Metadata`          | JSON: `{"squawk":"7700"}`               |
+| `vrate`         | `VerticalRate`      | m/s, positive = climbing                |
+| `squawk`        | `Squawk`            | Transponder code as string              |
 | `now`           | `Timestamp`         | Unix epoch → milliseconds               |
 |                 | `AssetType`         | Always `"aircraft"`                     |
 |                 | `H3Cell`            | Computed from lat/lon at res 7          |
 
-**Initial provider:** ADS-B Exchange or equivalent open feed.
-**Connection:** HTTP polling or WebSocket depending on provider.
+**Provider:** OpenSky Network `/states/all` (OAuth2 client credentials —
+see `internal/oauth2/token.go`).
+**Connection:** HTTP polling with exponential backoff via `RunWithReconnect`.
+**Enrichment:** aircraft metadata (registration, manufacturer, operator)
+refreshed from OpenSky's aircraft database CSV (~600k rows) via
+`fukan-ingest refresh --target airlines` into `fukan.aircraft_meta`.
 
-### AIS (Vessels)
+### AIS (Vessels) — IMPLEMENTED (Phase 3)
 
-| Source field    | FukanEvent field | Transformation                          |
-|-----------------|---------------------|-----------------------------------------|
-| `mmsi`          | `AssetID`           | 9-digit string                          |
-| `latitude`      | `Lat`               | `int32(lat * 10_000_000)`              |
-| `longitude`     | `Lon`               | `int32(lon * 10_000_000)`              |
-| `sog`           | `Speed`             | Tenths of knot → knots: `sog / 10.0`   |
-| `cog`           | `Heading`           | Tenths of degree → degrees: `cog / 10.0`|
-| `status`        | `Metadata`          | JSON: `{"nav_status":"under_way"}`      |
-| `timestamp`     | `Timestamp`         | Unix epoch → milliseconds               |
-|                 | `AssetType`         | Always `"vessel"`                       |
-|                 | `Alt`               | Always `0`                              |
-|                 | `H3Cell`            | Computed from lat/lon at res 7          |
+| Source field       | FukanEvent field | Transformation                                      |
+|--------------------|---------------------|-----------------------------------------------------|
+| `mmsi`             | `AssetID`           | 9-digit string                                      |
+| `name`             | `Callsign`          | Vessel name                                         |
+| `latitude`         | `Lat`               | `int32(lat * 10_000_000)`                          |
+| `longitude`        | `Lon`               | `int32(lon * 10_000_000)`                          |
+| `sog`              | `Speed`             | Knots                                               |
+| `cog`              | `Heading`           | Degrees (TrueHeading 511 → COG fallback)           |
+| `navigational_status` | `NavStatus`      | 0-15 mapped to `under_way`, `at_anchor`, `moored`, ... |
+| `rate_of_turn`     | `RateOfTurn`        | Degrees/minute                                      |
+| `imo_number`       | `IMONumber`         | From `ShipStaticData` message                       |
+| `ship_type`        | `ShipType`          | Code → `cargo`, `tanker`, `passenger`, ...          |
+| `destination`      | `Destination`       | From `ShipStaticData`                               |
+| `draught`          | `Draught`           | Meters                                              |
+| `dim_a/b/c/d`      | `DimA/B/C/D`        | Bow/stern/port/starboard reference distances (m)    |
+| `eta`              | `ETA`               | AIS ETA string                                      |
+| `timestamp`        | `Timestamp`         | Unix epoch → milliseconds                           |
+|                    | `AssetType`         | Always `"vessel"`                                   |
+|                    | `Alt`               | Always `0`                                          |
+|                    | `H3Cell`            | Computed from lat/lon at res 7                      |
 
-**Initial provider:** AISStream.io (WebSocket, clean JSON).
-**Connection:** Persistent WebSocket with auto-reconnect.
+**Provider:** aisstream.io (`wss://stream.aisstream.io/v0/stream`) with
+global bounding box subscription. Handles `PositionReport`,
+`StandardClassBPositionReport`, and `ShipStaticData` message types.
+**Connection:** Persistent WebSocket via `github.com/coder/websocket` with
+auto-reconnect through `RunWithReconnect`.
+**API key:** `integrations.ais[].api_key` in `config.yaml`.
 
-### Satellites (TLE Orbits)
+### Satellites (TLE Orbits) — IMPLEMENTED (Phase 4)
 
-| Source              | FukanEvent field | Transformation                        |
-|---------------------|---------------------|---------------------------------------|
-| TLE catalog number  | `AssetID`           | 5-digit NORAD ID as string            |
-| SGP4 output         | `Lat`               | `int32(lat * 10_000_000)`            |
-| SGP4 output         | `Lon`               | `int32(lon * 10_000_000)`            |
-| SGP4 output         | `Alt`               | Kilometers → meters: `int32(alt * 1000)` |
-| Propagation time    | `Timestamp`         | Propagation step time in ms           |
-|                     | `AssetType`         | Always `"satellite"`                  |
-|                     | `Speed`             | `0` (not meaningful for orbits)       |
-|                     | `Heading`           | `0` (not meaningful for orbits)       |
-|                     | `H3Cell`            | Computed from sub-satellite point     |
+| Source              | FukanEvent field | Transformation                              |
+|---------------------|---------------------|---------------------------------------------|
+| NORAD catalog ID    | `AssetID`           | NORAD ID as string                          |
+| OMM `OBJECT_NAME`   | `Callsign`          | Satellite designator (e.g. `STARLINK-30042`) |
+| SGP4 output         | `Lat`               | `int32(lat * 10_000_000)`                  |
+| SGP4 output         | `Lon`               | `int32(lon * 10_000_000)`                  |
+| SGP4 output         | `Alt`               | Kilometers → meters: `int32(alt * 1000)`   |
+| Propagation time    | `Timestamp`         | Propagation step time in ms                 |
+| TLE epoch           | `TLEEpoch`          | Unix ms                                     |
+| Computed            | `OrbitRegime`       | `leo` \| `meo` \| `geo` \| `heo`           |
+| Computed            | `Inclination`       | Degrees (from TLE)                          |
+| Computed            | `PeriodMinutes`     | From mean motion                            |
+| Computed            | `ApogeeKm`          | From semi-major axis + eccentricity         |
+| Computed            | `PerigeeKm`         | From semi-major axis + eccentricity         |
+| Tag                 | `Confidence`        | `official` \| `community_derived` \| `stale` |
+| Tag                 | `SatStatus`         | `maneuvering` \| `decaying` \| `""`         |
+|                     | `AssetType`         | Always `"satellite"`                        |
+|                     | `Speed`             | `0` (orbital velocity is regime-obvious)    |
+|                     | `Heading`           | `0` (not meaningful for orbits)             |
+|                     | `H3Cell`            | Computed from sub-satellite point           |
 
 **Sources:**
-- CelesTrak (public catalog, daily HTTP fetch of GP data) — primary source for all unclassified objects
-- planet4589.org / JSR Satellite Catalog (Jonathan McDowell) — supplemental source for classified/military objects not in the official US Space Command catalog. Community-derived from independent observations. Replaces the retired McCant's classified list. Note: uses its own catalog format (not standard TLE), parser must handle separately.
+- **CelesTrak** (GP JSON, HTTP fetch every 2h) — primary catalog, ~15k
+  active objects. Returns 403 if no data updated since last fetch, which
+  `RunWithReconnect` handles cleanly.
+- **Classified TLEs** (McCants / Molczan community lists) — ~500 classified
+  or military objects not in the official catalog. Tagged with
+  `Confidence: community_derived`.
 
-**Propagation pipeline:**
-```
-1. Fetch TLEs from CelesTrak every 24 hours (primary catalog)
-2. Fetch supplemental classified object data from planet4589.org (daily)
-3. Store raw TLE lines in memory (or local file cache)
-4. Run SGP4 propagation at regime-appropriate intervals:
-   - LEO (< 2,000 km): every 10 seconds
-   - MEO (2,000–35,786 km): every 30 seconds
-   - GEO (~35,786 km): every 60–300 seconds (barely moves)
-   - HEO (elliptical): every 10 seconds (fast-moving perigee)
-5. Emit FukanEvent for each computed position
-6. Enrich metadata with orbit regime: {"regime":"leo"}, {"regime":"geo"}, etc.
-7. For planet4589.org objects, tag confidence: {"confidence":"community_derived"}
-8. Maneuver detection: compare daily TLE mean motion / inclination
-   - If delta exceeds threshold → set metadata: {"status":"maneuvering"}
-9. Decay detection: monitor BSTAR drag term + perigee altitude
-   - If perigee < 150km → set metadata: {"status":"decaying"}
-```
+**Propagation loop:** Single `tle` worker manages fetching + propagation.
+Four goroutines run in parallel, one per orbit regime, at regime-appropriate
+cadence:
 
-**Go library:** `github.com/shanehandley/go-satellite` for SGP4.
+| Regime | Interval | Why |
+|---|---|---|
+| LEO (< 2,000 km) | 30 s | Fast ground-track motion |
+| MEO (2,000–35,786 km) | 60 s | Slower apparent motion |
+| GEO (~35,786 km) | 120 s | Near-stationary in ECEF |
+| HEO (eccentric) | 30 s | Fast perigee passes |
 
-### BGP (Internet Routing)
+Aggregate event rate ~455 events/s across all regimes.
+
+**Staleness:** TLEs older than 14 days (LEO/HEO) or 30 days (MEO/GEO) are
+tagged `Confidence: stale` — SGP4 accuracy degrades rapidly past the
+epoch's validity window.
+
+**Maneuver detection:** Compares mean motion (>0.01 rev/day delta) and
+inclination (>0.1° delta) between TLE fetch cycles. On a match the new
+entry is tagged `SatStatus: maneuvering`.
+
+**Decay detection:** Checks perigee < 150 km or BSTAR > 0.01 at propagation
+time. On a match the event is tagged `SatStatus: decaying`.
+
+**Go library:** `github.com/akhenakh/sgp4` (Apache 2.0) — accepts OMM JSON
+directly via `TLE.FindPositionAtTime()` + `ToGeodetic()`.
+
+**Metadata enrichment:** GCAT (`planet4589.org/space/gcat/tsv/cat/satcat.tsv`)
+loaded into `fukan.satellite_meta` via `fukan-ingest refresh --target satellites`.
+See `internal/refresh/satellite.go` — the loader provides name, owner,
+country, launch date, mass, apogee/perigee/inclination, object type, status.
+
+### BGP (Internet Routing) — PLANNED (PLAN.md Phase 5)
 
 | Source              | FukanEvent field | Transformation                        |
 |---------------------|---------------------|---------------------------------------|
 | ASN                 | `AssetID`           | `"AS12345"` format                    |
 | MaxMind GeoIP       | `Lat/Lon`           | Mapped from ASN owner → coords        |
-| BGPStream event     | `Metadata`          | JSON: `{"event_type":"hijack","prefix":"1.2.3.0/24"}` |
 | Event time          | `Timestamp`         | Unix epoch → milliseconds             |
 |                     | `AssetType`         | Always `"bgp_node"`                   |
-|                     | `Alt`               | Always `0`                            |
-|                     | `Speed`             | Always `0`                            |
-|                     | `H3Cell`            | Computed from GeoIP coordinates       |
+
+Routing-specific fields (event type, prefix, path) will land as typed
+ClickHouse columns alongside the existing ones — per the denormalization
+rule, no `Metadata` JSON blob.
 
 **Source:** CAIDA BGPStream (free, open for tools).
 **GeoIP:** MaxMind GeoLite2-ASN database (free, updated weekly).
 
-### News (Geolocated Events)
+### News (Geolocated Events) — PLANNED (PLAN.md Phase 6)
 
 | Source              | FukanEvent field | Transformation                        |
 |---------------------|---------------------|---------------------------------------|
 | GDELT event ID      | `AssetID`           | GDELT GlobalEventID or hash           |
 | GDELT ActionGeo     | `Lat/Lon`           | Pre-geolocated by GDELT               |
-| GDELT               | `Metadata`          | JSON: `{"headline":"...","url":"...","tone":-2.5}` |
-| Publication time     | `Timestamp`         | Unix epoch → milliseconds             |
+| Publication time    | `Timestamp`         | Unix epoch → milliseconds             |
 |                     | `AssetType`         | Always `"news"`                       |
-|                     | `Alt`               | Always `0`                            |
-|                     | `Speed`             | Always `0`                            |
-|                     | `H3Cell`            | Computed from GDELT coordinates       |
+
+News-specific fields (headline, URL, tone) will land as typed columns
+on a dedicated news table or shared fields on `telemetry_raw` — TBD
+during implementation.
 
 **Source:** GDELT Project (free, pre-geolocated global news, 15-minute update cycle).
 **Storage rule:** Headline + source URL + sentiment score only. **Never store full article text** (copyright).
@@ -554,46 +716,83 @@ func (d *DedupWindow) Sweep() {
 -- scripts/clickhouse-init.sql
 
 -- Raw telemetry (full history)
+-- Canonical DDL lives in internal/commands/migrations/ and is applied via
+-- `fukan-ingest migrate up` (golang-migrate with embed.FS). The schema
+-- shown here is the MergeTree/AggregatingMergeTree shape after all
+-- migrations through 000006. Feed-specific fields (squawk, nav_status,
+-- imo_number, ship_type, destination, draught, dim_a/b/c/d, eta,
+-- rate_of_turn, orbit_regime, confidence, tle_epoch, inclination,
+-- period_minutes, apogee_km, perigee_km, sat_status) all live as typed
+-- columns — see migrations 000003, 000004, 000005, 000006 for the
+-- column-by-column additions.
+
 CREATE TABLE IF NOT EXISTS fukan.telemetry_raw (
-    timestamp     DateTime        CODEC(DoubleDelta, LZ4),
+    event_time    DateTime64(3)   CODEC(DoubleDelta, LZ4),
     asset_id      String          CODEC(LZ4),
     asset_type    LowCardinality(String),
+    callsign      String          CODEC(LZ4),
+    origin        LowCardinality(String),
+    category      LowCardinality(String),
     lat           Int32           CODEC(DoubleDelta, LZ4),
     lon           Int32           CODEC(DoubleDelta, LZ4),
     alt           Int32           CODEC(DoubleDelta, LZ4),
     speed         Float32         CODEC(Gorilla, LZ4),
     heading       Float32         CODEC(Gorilla, LZ4),
+    vertical_rate Float32         CODEC(Gorilla, LZ4),
     h3_cell       UInt64          CODEC(LZ4),
     source        LowCardinality(String),
-    metadata      String          CODEC(LZ4)
+    -- ...plus the feed-specific typed columns listed above.
+    -- NO `metadata String` — removed in migration 000004 (denormalization).
 ) ENGINE = MergeTree()
-ORDER BY (asset_type, asset_id, timestamp)
-PARTITION BY toYYYYMMDD(timestamp)
-TTL timestamp + INTERVAL 2 DAY
+ORDER BY (asset_type, h3_cell, event_time, asset_id)
+PARTITION BY toStartOfHour(event_time)
+TTL event_time + INTERVAL 2 DAY
         MODIFY CODEC(DoubleDelta, ZSTD(3)),
-    timestamp + INTERVAL 90 DAY
+    event_time + INTERVAL 90 DAY
         TO VOLUME 'cold'
 SETTINGS index_granularity = 8192;
 
--- Latest position per asset (materialized view)
+-- Latest position per asset — AggregatingMergeTree, populated via
+-- telemetry_latest_mv which projects argMaxState(column, event_time)
+-- for every field. telemetry_latest_flat is the read-side view that
+-- applies argMaxMerge() so Rails can SELECT the flat shape.
 CREATE TABLE IF NOT EXISTS fukan.telemetry_latest (
-    timestamp     DateTime,
-    asset_id      String,
-    asset_type    LowCardinality(String),
-    lat           Int32,
-    lon           Int32,
-    alt           Int32,
-    speed         Float32,
-    heading       Float32,
-    h3_cell       UInt64,
-    source        LowCardinality(String),
-    metadata      String
-) ENGINE = ReplacingMergeTree(timestamp)
+    asset_type         LowCardinality(String),
+    asset_id           String,
+    ts_state           AggregateFunction(max, DateTime64(3)),
+    callsign_state     AggregateFunction(argMax, String, DateTime64(3)),
+    lat_state          AggregateFunction(argMax, Int32, DateTime64(3)),
+    lon_state          AggregateFunction(argMax, Int32, DateTime64(3)),
+    alt_state          AggregateFunction(argMax, Int32, DateTime64(3)),
+    -- ...argMax state columns for every field in telemetry_raw.
+    -- See migrations 000003, 000005, 000006 for the full list.
+) ENGINE = AggregatingMergeTree()
 ORDER BY (asset_type, asset_id);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS fukan.telemetry_latest_mv
 TO fukan.telemetry_latest AS
-SELECT * FROM fukan.telemetry_raw;
+SELECT
+    asset_type,
+    asset_id,
+    maxState(event_time)                AS ts_state,
+    argMaxState(callsign, event_time)   AS callsign_state,
+    argMaxState(lat, event_time)        AS lat_state,
+    -- ...one argMaxState per column.
+FROM fukan.telemetry_raw
+GROUP BY asset_type, asset_id;
+
+-- Flat read-side view — argMaxMerge() for each state column so queries
+-- can SELECT the current-state shape without thinking about aggregates.
+CREATE VIEW IF NOT EXISTS fukan.telemetry_latest_flat AS
+SELECT
+    asset_type,
+    asset_id,
+    maxMerge(ts_state)                  AS event_time,
+    argMaxMerge(callsign_state)         AS callsign,
+    argMaxMerge(lat_state)              AS lat,
+    -- ...argMaxMerge per column.
+FROM fukan.telemetry_latest
+GROUP BY asset_type, asset_id;
 
 -- H3 density aggregation (for zoomed-out heatmaps)
 CREATE TABLE IF NOT EXISTS fukan.telemetry_h3_agg (
@@ -669,7 +868,7 @@ GROUP BY time_bucket, h3_cell, asset_type;
 ### Base Structure
 
 ```go
-// internal/worker/base.go
+// internal/worker/worker.go
 
 // Worker is the interface all feed workers implement.
 type Worker interface {
