@@ -1,6 +1,6 @@
 # Fukan Ingest — Implementation Plan
 
-> Last updated: 2026-04-06
+> Last updated: 2026-04-11
 
 ---
 
@@ -59,16 +59,39 @@
 - ~~`redis.PublishBatch` returns `error` instead of swallowing pipeline failures~~
 - ~~Missing packages implemented: `internal/worker` (interface), `internal/worker/adsb` (stub), `internal/batcher`~~
 
+## Phase 2.7 — Live Broadcast Pipeline (2026-04-11)
+
+- ~~FukanEvent extended with `Callsign`, `Origin`, `Category`, `VerticalRate` fields for richer client-side rendering~~
+- ~~Migration `000003_add_telemetry_fields`: adds `callsign` / `origin` / `category` / `vertical_rate` columns to `telemetry_raw` and matching `AggregateFunction(argMax, ...)` states to `telemetry_latest`; recreates `telemetry_latest_mv` / `telemetry_latest_flat`~~
+- ~~ADS-B parser populates the new fields from OpenSky `/states/all`~~
+- ~~Redis publisher rewritten to emit AnyCable broadcast envelopes (`{"stream":"telemetry:<h3_hex>","data":"<event_json>"}`) on the `__anycable__` channel~~
+- ~~Multi-resolution H3 fan-out (res 2–7) so the frontend can subscribe at any zoom band without server-side child expansion; cell ids use h3-go `Cell.String()` to match h3-js~~
+- ~~Batcher grows a dedicated broadcast goroutine (`broadcastLoop`) fed by a bounded 50k-event channel, decoupled from the ClickHouse flush~~
+- ~~Broadcast dual-threshold flush: 500 events or 50 ms, single in-flight Redis pipeline `Exec` with 5 s timeout~~
+- ~~`DrainAndFlush` sequence updated: CH flush → CH retry drain → close `broadcastCh` → await `broadcastDone`~~
+
 ---
 
-## Phase 3 — AIS Feed (Vessels)
+## Phase 2.8 — Schema Denormalization (2026-04-12)
 
-- [ ] AIS WebSocket worker (`internal/worker/ais`)
-- [ ] Parser: AISStream.io JSON → FukanEvent (MMSI, sog/10→knots, cog/10→degrees, nav_status metadata)
-- [ ] Persistent WebSocket with auto-reconnect via `RunWithReconnect`
-- [ ] Env var: `AISSTREAM_API_KEY`
-- [ ] Fixture-based parser tests
-- [ ] Wire into `worker --type ais`
+- ~~Migration `000004_denormalize_metadata`: replaces `metadata` JSON blob with 12 typed columns on `telemetry_raw` (`squawk`, `nav_status`, `imo_number`, `ship_type`, `destination`, `draught`, `dim_a/b/c/d`, `eta`, `rate_of_turn`)~~
+- ~~`metadata` column dropped — ClickHouse columnar storage makes sparse typed columns free; `JSONExtract()` on a String column is expensive at scale~~
+- ~~7 new `argMax` state columns on `telemetry_latest`; `telemetry_latest_mv` / `telemetry_latest_flat` recreated with all new fields~~
+- ~~`FukanEvent` struct: `Metadata string` replaced with typed Go fields (`Squawk`, `NavStatus`, `IMONumber`, `ShipType`, `Destination`, `Draught`, `DimA/B/C/D`, `ETA`, `RateOfTurn`)~~
+- ~~`InsertBatch` updated: 12 new typed columnar encoders replace single `colMeta`~~
+- ~~ADS-B parser: squawk set directly on `event.Squawk` instead of `json.Marshal` to metadata blob~~
+- ~~ADS-B parser tests updated to assert `Squawk` field~~
+
+## Phase 3 — AIS Feed (Vessels) (2026-04-12)
+
+- ~~AIS WebSocket worker (`internal/worker/ais/worker.go`): persistent connection to `wss://stream.aisstream.io/v0/stream` via `github.com/coder/websocket`, global bounding box, auto-reconnect via `RunWithReconnect`~~
+- ~~Parser (`internal/worker/ais/parser.go`): handles `PositionReport`, `StandardClassBPositionReport`, and `ShipStaticData` message types~~
+- ~~Position reports: MMSI as AssetID, Sog as knots, TrueHeading with 511→Cog fallback, NavigationalStatus mapped to string (0-15), RateOfTurn~~
+- ~~Ship static data: IMO number, ship type code mapped to category (cargo, tanker, passenger, etc.), destination, draught, dimensions (A/B/C/D), ETA~~
+- ~~API key via `integrations.ais[].api_key` in config YAML~~
+- ~~Fixture-based parser tests: 8 tests covering all message types, heading fallback, edge cases~~
+- ~~Wired into `worker --type ais` + `batcher --type vessel` (batcher already generic)~~
+- ~~`config.example.yaml` updated with AIS integration section~~
 
 ## Phase 4 — Satellite Feed (TLE Orbits)
 

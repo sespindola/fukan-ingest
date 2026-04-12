@@ -1,6 +1,8 @@
 # Fukan Ingest — Architecture
 
-> Go ETL pipeline that consumes external telemetry feeds, normalizes them into a unified schema, publishes via NATS core (RAM-only), batch-inserts into ClickHouse, and publishes live updates to Redis.
+> Last updated: 2026-04-11
+
+> Go ETL pipeline that consumes external telemetry feeds, normalizes them into a unified schema, publishes via NATS core (RAM-only), batch-inserts into ClickHouse, and broadcasts live updates to anycable-go via Redis pub/sub.
 
 ---
 
@@ -24,13 +26,16 @@ External Feeds (ADS-B, AIS, TLE, BGP, News)
                    ▼
 ┌──────────────────────────────────────────┐
 │ Batchers (one per asset type)            │
-│  Accumulate 10k events OR 2s timeout     │
+│  ClickHouse path: 10k events OR 2s       │
+│  Broadcast path:  500 events OR 50ms     │
+│  (decoupled goroutines)                  │
 └─────────┬────────────────┬───────────────┘
           │                │
           ▼                ▼
     ClickHouse         Redis pub/sub
-    (native proto)     telemetry:{h3_cell}
-    telemetry_raw      (non-fatal)
+    (native proto)     __anycable__ channel
+    telemetry_raw      (AnyCable envelope,
+                        H3 res 2–7 fan-out)
           │
           ▼ (materialized views)
     telemetry_latest   (ReplacingMergeTree)
@@ -130,6 +135,7 @@ internal/
     migrations/                    # Embedded SQL migration files
       000001_create_telemetry_tables.{up,down}.sql
       000002_create_aircraft_meta.{up,down}.sql
+      000003_add_telemetry_fields.{up,down}.sql
 
   config/config.go                 # Typed config structs + Validate()
   model/event.go                   # FukanEvent canonical struct
@@ -159,17 +165,21 @@ Canonical `FukanEvent` struct and validation.
 
 ```go
 type FukanEvent struct {
-    Timestamp int64     `json:"ts"`    // Unix epoch milliseconds
-    AssetID   string    `json:"id"`    // ICAO hex, MMSI, NORAD ID, ASN, or event hash
-    AssetType AssetType `json:"type"`  // aircraft|vessel|satellite|bgp_node|news
-    Lat       int32     `json:"lat"`   // latitude  * 10_000_000  (Int32, NOT float)
-    Lon       int32     `json:"lon"`   // longitude * 10_000_000
-    Alt       int32     `json:"alt"`   // meters above sea level
-    Speed     float32   `json:"spd"`   // knots
-    Heading   float32   `json:"hdg"`   // degrees 0-360
-    H3Cell    uint64    `json:"h3"`    // H3 index at resolution 7
-    Source    string    `json:"src"`   // provider identifier
-    Metadata  string    `json:"meta"`  // JSON blob, type-specific
+    Timestamp    int64     `json:"ts"`       // Unix epoch milliseconds
+    AssetID      string    `json:"id"`       // ICAO hex, MMSI, NORAD ID, ASN, or event hash
+    AssetType    AssetType `json:"type"`     // aircraft|vessel|satellite|bgp_node|news
+    Callsign     string    `json:"callsign"` // flight callsign, vessel name, satellite designator
+    Origin       string    `json:"origin"`   // origin country, city, airport, port
+    Category     string    `json:"cat"`      // asset category (aircraft wake class, vessel type, ...)
+    Lat          int32     `json:"lat"`      // latitude  * 10_000_000  (Int32, NOT float)
+    Lon          int32     `json:"lon"`      // longitude * 10_000_000
+    Alt          int32     `json:"alt"`      // meters above sea level
+    Speed        float32   `json:"spd"`      // knots
+    Heading      float32   `json:"hdg"`      // degrees 0-360
+    VerticalRate float32   `json:"vr"`       // meters/second, positive = climbing
+    H3Cell       uint64    `json:"h3"`       // H3 index at resolution 7
+    Source       string    `json:"src"`      // provider identifier
+    Metadata     string    `json:"meta"`     // JSON blob, type-specific
 }
 ```
 
@@ -192,12 +202,21 @@ Callers use `*nats.Conn` directly for `QueueSubscribe`, `Drain`, `Close`.
 
 ### `internal/batcher`
 
-Dual-threshold batching engine with retry.
+Two independent pipelines share a single `HandleMsg` entry point. Each NATS message is (1) validated, (2) enqueued on a bounded broadcast channel for live streaming, and (3) appended to the ClickHouse buffer for persistence. The two paths are decoupled so live subscribers see updates within ~50 ms regardless of the ClickHouse buffer state, and neither path spawns a goroutine per event.
 
+**ClickHouse path** (dual-threshold flush to `telemetry_raw`):
 - **Size threshold:** 10,000 events triggers immediate flush.
 - **Time threshold:** 2-second `AfterFunc` timer triggers flush if buffer is non-empty.
-- **Retry:** Failed inserts retry with exponential backoff (100ms initial, 5s cap, 5 attempts). In-flight retry goroutines capped at 10 via semaphore.
-- **Shutdown:** `DrainAndFlush()` flushes remaining buffer, then waits for all in-flight retries to complete.
+- **Retry:** Failed inserts retry with exponential backoff (100ms initial, 5s cap, 5 attempts). In-flight retry goroutines capped at 10 via semaphore. Retries detect `client is closed` errors and reconnect the ClickHouse client in place.
+
+**Broadcast path** (dedicated `broadcastLoop()` goroutine spawned in `New()`):
+- **Channel:** `broadcastCh` bounded at 50,000 events. On overflow the event is dropped with a warning — broadcasts are non-critical and ClickHouse is the source of truth.
+- **Size threshold:** 500 events coalesced into a single Redis pipeline `Exec`.
+- **Time threshold:** 50 ms ticker flushes any pending events.
+- **Timeout:** Each pipeline `Exec` is bounded by a 5 s context.
+- Only one `Exec` is in flight at a time (single broadcaster), so the Redis connection pool sees a small, steady workload under burst.
+
+**Shutdown:** `DrainAndFlush()` (1) flushes the ClickHouse buffer synchronously, (2) waits for all in-flight ClickHouse retries, (3) closes `broadcastCh` so the broadcaster drains any remainder and returns, (4) blocks on `broadcastDone` before allowing the Redis client to close.
 
 ### `internal/clickhouse`
 
@@ -207,7 +226,7 @@ Two free functions — no wrapper types:
 
 ### `internal/redis`
 
-- `Publisher` struct with `PublishBatch(ctx, events) error` — groups events by H3 cell, publishes JSON to Redis channels `telemetry:{h3_cell}` using a pipeline. Per-event marshal failures are logged and skipped; pipeline exec errors are returned to the caller.
+- `Publisher` struct with `PublishBatch(ctx, events) error` — broadcasts to anycable-go via the Redis pub/sub channel `__anycable__` (the anycable-go default for `broadcast_adapters = ["redis"]`). Each event is wrapped in an `anycableEnvelope` of shape `{"stream": "telemetry:<h3_hex>", "data": "<event_json>"}` and fanned out across H3 resolutions 2–7. The cell id is encoded via h3-go's `Cell.String()` so it matches what the browser's `polygonToCells()` (h3-js) returns — the frontend can subscribe at any altitude band without server-side child expansion. All envelopes for one batch are sent in a single Redis pipeline `Exec`. Called exclusively from `batcher.broadcastLoop()`.
 
 ### `internal/signal`
 
@@ -250,7 +269,9 @@ Typed configuration structs with `mapstructure` tags for Viper unmarshalling:
 | Load distribution | NATS queue groups: `batcher-{asset_type}` share work. |
 | Backpressure | None from broker; batcher flush controls local memory. |
 | CH failure behavior | Retry with exponential backoff (100ms→5s, 5 attempts, 10 concurrent cap). |
-| Shutdown behavior | Batchers `DrainAndFlush()`; NATS `Drain()` to flush pending. |
+| Live broadcast latency | ≤50 ms from NATS arrival to Redis publish, independent of ClickHouse buffer state. |
+| Broadcast overflow | 50k-event bounded channel; on overflow events are dropped with a warning (ClickHouse path unaffected). |
+| Shutdown behavior | Batchers `DrainAndFlush()`: CH flush → CH retry drain → broadcast channel close → broadcast drain. NATS `Drain()` to flush pending. |
 
 ---
 
@@ -258,8 +279,8 @@ Typed configuration structs with `mapstructure` tags for Viper unmarshalling:
 
 Managed via golang-migrate. Migration files are embedded in the binary at `internal/commands/migrations/`. Apply with `fukan-ingest migrate up`.
 
-1. **`telemetry_raw`** — MergeTree, partitioned by hour, ordered by `(asset_type, h3_cell, event_time, asset_id)`. TTL: 24 hours (dev/validation). Production target: 90 days with tiered storage.
-2. **`telemetry_latest`** — AggregatingMergeTree. Latest position per `(asset_type, asset_id)` via argMax aggregate states.
+1. **`telemetry_raw`** — MergeTree, partitioned by hour, ordered by `(asset_type, h3_cell, event_time, asset_id)`. TTL: 24 hours (dev/validation). Production target: 90 days with tiered storage. Columns include `callsign` (LZ4), `origin` / `category` (LowCardinality), and `vertical_rate` (Gorilla+LZ4) added in migration 000003.
+2. **`telemetry_latest`** — AggregatingMergeTree. Latest position per `(asset_type, asset_id)` via argMax aggregate states. Migration 000003 added `callsign_state`, `origin_state`, `category_state`, and `vertical_rate_state`, and the `telemetry_latest_mv` / `telemetry_latest_flat` views were recreated to populate and merge them.
 3. **`telemetry_h3_agg`** — SummingMergeTree. 5-minute bucketed density counts per `(h3_cell, asset_type)` for heatmaps.
 4. **`aircraft_meta`** — ReplacingMergeTree. Aircraft reference data from OpenSky (ICAO24, registration, operator, images).
 

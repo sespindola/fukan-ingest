@@ -51,8 +51,18 @@ External feed (ADS-B, AIS, TLE, BGP, News)
 ### Data Ownership Rule
 
 ```
-This pipeline OWNS all writes to ClickHouse.
-The web layer (Rails) reads from ClickHouse but NEVER writes.
+This pipeline OWNS all writes to ClickHouse, with one explicit exception:
+
+  EXCEPTION — aircraft_meta image enrichment:
+  The web layer (Rails) may write image_url, image_attribution, and
+  updated_at on aircraft_meta rows. This happens lazily, on-click,
+  via Aircraft::FetchImage in fukan-web because the upstream provider
+  (Planespotters) is rate-limited and cannot be bulk-pre-fetched by
+  ingest. ALL OTHER aircraft_meta columns (registration, manufacturer,
+  model, operator, etc.) remain ingest-owned and MUST NOT be written
+  from Rails.
+
+The web layer reads all other ClickHouse tables but NEVER writes to them.
 This pipeline publishes to Redis pub/sub for real-time streaming.
 The web layer (AnyCable) subscribes to Redis but this pipeline NEVER reads from it.
 ```
