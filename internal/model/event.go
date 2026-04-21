@@ -10,18 +10,20 @@ const (
 	AssetNews      AssetType = "news"
 )
 
-// FukanEvent is the canonical normalized event.
-// Every ETL worker MUST produce this struct. No exceptions.
+// FukanEvent is the canonical normalized event for moving assets
+// (aircraft, vessels, satellites). BGP events DO NOT flow through this
+// struct — they use BgpEvent and their own NATS subject / ClickHouse
+// table / AnyCable stream prefix. See bgp_event.go.
 type FukanEvent struct {
 	Timestamp    int64     `json:"ts"`       // Unix epoch milliseconds
-	AssetID      string    `json:"id"`       // ICAO hex, MMSI, NORAD ID, ASN, or event hash
-	AssetType    AssetType `json:"type"`     // aircraft, vessel, satellite, bgp_node, news
+	AssetID      string    `json:"id"`       // ICAO hex, MMSI, NORAD ID
+	AssetType    AssetType `json:"type"`     // aircraft, vessel, satellite
 	Callsign     string    `json:"callsign"` // flight callsign, vessel name, satellite designator
 	Origin       string    `json:"origin"`   // origin country, city, airport, port
 	Category     string    `json:"cat"`      // asset category (e.g. aircraft wake class, vessel type)
 	Lat          int32     `json:"lat"`      // latitude * 10_000_000
 	Lon          int32     `json:"lon"`      // longitude * 10_000_000
-	Alt          int32     `json:"alt"`      // meters above sea level (0 for surface/network)
+	Alt          int32     `json:"alt"`      // meters above sea level (0 for surface)
 	Speed        float32   `json:"spd"`      // knots (aircraft/vessel) or 0
 	Heading      float32   `json:"hdg"`      // degrees (0-360) or 0
 	VerticalRate float32   `json:"vr"`       // meters/second, positive = climbing

@@ -324,9 +324,9 @@ fukan-ingest/
 fukan.telemetry.aircraft     # ADS-B normalized events
 fukan.telemetry.vessel       # AIS normalized events
 fukan.telemetry.satellite    # Propagated TLE positions
-fukan.telemetry.bgp          # BGP routing events
 fukan.telemetry.news         # Geolocated news events
-fukan.telemetry.>            # Wildcard (all telemetry)
+fukan.telemetry.>            # Wildcard (moving-asset telemetry)
+fukan.bgp.events             # BGP routing events (event-stream, dedicated subject)
 ```
 
 ### Queue Groups
@@ -674,21 +674,26 @@ loaded into `fukan.satellite_meta` via `fukan-ingest refresh --target satellites
 See `internal/refresh/satellite.go` — the loader provides name, owner,
 country, launch date, mass, apogee/perigee/inclination, object type, status.
 
-### BGP (Internet Routing) — PLANNED (PLAN.md Phase 5)
+### BGP (Internet Routing) — IMPLEMENTED (split pipeline, see ARCHITECTURE.md)
 
-| Source              | FukanEvent field | Transformation                        |
-|---------------------|---------------------|---------------------------------------|
-| ASN                 | `AssetID`           | `"AS12345"` format                    |
-| MaxMind GeoIP       | `Lat/Lon`           | Mapped from ASN owner → coords        |
-| Event time          | `Timestamp`         | Unix epoch → milliseconds             |
-|                     | `AssetType`         | Always `"bgp_node"`                   |
+BGP events do **not** share the `FukanEvent` / `telemetry_raw` / `telemetry_latest` pipeline. They flow through a dedicated pipeline with their own model, subject, batcher, ClickHouse table, and Redis stream prefix:
 
-Routing-specific fields (event type, prefix, path) will land as typed
-ClickHouse columns alongside the existing ones — per the denormalization
-rule, no `Metadata` JSON blob.
+| Stage        | Telemetry (aircraft/vessel/satellite) | BGP                             |
+|--------------|---------------------------------------|---------------------------------|
+| Go struct    | `model.FukanEvent`                    | `model.BgpEvent`                |
+| NATS subject | `fukan.telemetry.<type>`              | `fukan.bgp.events`              |
+| Batcher      | `batcher.Batcher`                     | `batcher.BGPBatcher`            |
+| CH table     | `telemetry_raw` + `telemetry_latest`  | `bgp_events` (append-only)      |
+| Redis prefix | `telemetry:<h3>` (res 2–7)            | `bgp:<h3>` (res 3 only)         |
 
-**Source:** CAIDA BGPStream (free, open for tools).
-**GeoIP:** MaxMind GeoLite2-ASN database (free, updated weekly).
+`BgpEvent` fields: `Timestamp`, `EventID`, `Category` (announcement / hijack / leak / withdrawal), `Prefix`, `OriginAS` (announcer from RIS Live), `PrefixAS` + `PrefixOrg` (registered holder from GeoLite2-ASN; diverges from `OriginAS` on hijacks), `ASPath`, `PathCoords`, `Collector`, `Lat`, `Lon`, `H3Cell`, `Source`.
+
+**Source:** RIPE NCC RIS Live websocket (`wss://ris-live.ripe.net/v1/ws/`), no API key.
+**Geolocation (two-tier):**
+1. MaxMind **GeoLite2-City** MMDB (via `oschwald/geoip2-golang`) keyed on the prefix's network address — city-level precision, sub-µs in-process lookups.
+2. Fallback: ASN seed table + async RIPEstat (`internal/worker/bgp/geo.go`) — country-centroid precision.
+**Org enrichment:** MaxMind **GeoLite2-ASN** MMDB (separate free file, ~8.5 MB) resolves the prefix to its registered holder AS + org. On hijacks this diverges from `OriginAS` (announcer from RIS Live) — the gap is the OSINT signal. See `ASNLookup` in `internal/worker/bgp/asn.go`.
+MMDB paths are set in `config.yaml` under `geoip.city_db` and `geoip.asn_db` (no env vars); BGP worker fails fast if either is missing. Per-hop `path_coords` uses the ASN-centroid path only.
 
 ### News (Geolocated Events) — PLANNED (PLAN.md Phase 6)
 
@@ -1096,8 +1101,8 @@ CELESTRAK_URL=https://celestrak.org/NORAD/elements/gp.php
 PLANET4589_URL=https://planet4589.org/space/gcat/data/cat/satcat.tsv
 BGPSTREAM_PROJECT=ris-live
 
-# GeoIP
-MAXMIND_DB_PATH=/data/GeoLite2-ASN.mmdb
+# GeoIP — configured via config.yaml (geoip.city_db), not env vars.
+# GeoLite2-City MMDB; BGP worker fails fast on missing/unreadable file.
 ```
 
 ---
