@@ -1,6 +1,6 @@
 # Fukan Ingest — Implementation Plan
 
-> Last updated: 2026-04-11
+> Last updated: 2026-04-18
 
 ---
 
@@ -116,13 +116,47 @@
 - ~~Migration `000006_add_sat_status`: adds `sat_status` LowCardinality(String) column to `telemetry_raw` + argMax state to `telemetry_latest`; recreates MV + flat view~~
 - ~~5 new tests: maneuver detection (no-change, period shift, plane change), decay detection (healthy, low perigee), propagateOne with decaying/maneuvering status~~
 
-## Phase 5 — BGP Feed (Internet Routing)
+## Phase 5 — BGP Feed (Internet Routing) (2026-04-16)
 
-- [ ] BGPStream consumer (`internal/worker/bgp`)
-- [ ] GeoIP mapping: ASN → coordinates via MaxMind GeoLite2-ASN (`internal/worker/bgp/geoip.go`)
-- [ ] Parser: BGP events → FukanEvent (ASN, hijack/leak detection, prefix metadata)
-- [ ] Env vars: `BGPSTREAM_PROJECT`, `MAXMIND_DB_PATH`
-- [ ] Tests
+Design diverged from the original plan. BGPStream + MaxMind were both dropped in favor of RIPE RIS Live (WebSocket, no API key) + an embedded ASN seed table with background RIPEstat enrichment. More importantly, BGP events turned out to be fundamentally different from moving-asset telemetry: each RIS Live event is a one-time happening (announcement/withdrawal/hijack/leak), not a position update. Forcing them through `FukanEvent` + `telemetry_raw` + `telemetry_latest` exploded the `argMax`-keyed latest table to ~800k rows and saturated the Redis broadcast path. Phase 5 therefore ships a **split pipeline**: BGP owns its own event struct, NATS subject, ClickHouse table, and Redis stream prefix.
+
+- ~~`internal/worker/bgp` — RIS Live WebSocket consumer (`worker.go`) via `coder/websocket`, subscribes to `UPDATE` messages, reconnect via `RunWithReconnect`~~
+- ~~`parser.go` — flattens AS_SET elements, detects leaks (Tier-1 downstream of non-Tier-1) and hijacks (origin change on known prefix), emits `BgpEvent` per prefix per category~~
+- ~~`state.go` — bounded (~500k entries, LRU-pruned by lastSeen) prefix → origin-AS map for hijack detection and withdrawal filtering~~
+- ~~`geo.go` + `tables.go` — embedded ASN → (lat, lon) seed table with background RIPEstat fetches for unknown ASNs; `resolvePathCoords` skips unresolved hops rather than emitting null-island coordinates~~
+- ~~12 parser tests covering announcement / hijack / leak / withdrawal / AS_SET / unresolved-ASN paths~~
+- ~~`model.BgpEvent` struct (`internal/model/bgp_event.go`) — parallel to `FukanEvent`, fields: `ts`, `id`, `cat`, `prefix`, `origin_as`, `as_path`, `path_coords`, `collector`, `lat`, `lon`, `h3`, `src`~~
+- ~~`ValidateBgp()` — null-island, out-of-range, empty id / category / source checks~~
+- ~~Dedicated NATS subject `fukan.bgp.events` (not `fukan.telemetry.bgp`) with queue group `batcher-bgp`~~
+- ~~Migration `000007_create_bgp_events` — append-only MergeTree, ORDER BY `(category, h3_cell, event_time)`, PARTITION BY hour, 24 h TTL. Replaced staged migrations 000007/000008 (never committed) that had put BGP columns on `telemetry_raw` + argMax states on `telemetry_latest`~~
+- ~~`clickhouse.InsertBGPBatch` — columnar insert into `bgp_events`; BGP fields removed from `InsertBatch` (telemetry path)~~
+- ~~`batcher.BGPBatcher` — parallel struct to `Batcher`, same dual-threshold flush (10k / 2s CH, 500 / 50 ms broadcast), calls `InsertBGPBatch` + `PublishBGPBatch`~~
+- ~~`redis.PublishBGPBatch` — stream prefix `bgp:<h3>`, fan-out at **res 3 only** (6× reduction in Redis PUBLISH calls per event vs the telemetry res 2–7 set). BGP event coordinates are imprecise enough that zoom-band-precise subscriptions would be misleading; frontend always subscribes at res 3 via `cellToParent(cell, 3)`~~
+- ~~`commands/batcher.go` switches on `--type bgp` to instantiate `BGPBatcher` against `fukan.bgp.events`~~
+- ~~Config: `integrations.bgp[]` in `config.example.yaml`, single RIS Live entry (no API key required)~~
+
+## Phase 5.1 — GeoIP Enrichment (✅ 2026-04-17)
+
+Country-centroid precision (Geo seed + RIPEstat) was too coarse: all events from a given origin AS plotted to a single point, and fresh ASNs were dropped on first sight. Replaced with an in-process MaxMind GeoLite2-City MMDB via `oschwald/geoip2-golang`:
+
+- ~~`internal/worker/bgp/city.go` — `CityLookup` wrapper: `NewCityLookup(path)` opens the MMDB (fail-fast on missing file), `LookupPrefix(prefix)` parses CIDR via `net/netip`, extracts the network address, and returns `(lat, lon, ok)` from `Reader.City(ip)`. Guards against null-island zero coords.~~
+- ~~Two-tier resolution in parser: MMDB on the prefix → existing `Geo.Lookup(originAS)` ASN-centroid fallback → drop. Applied symmetrically to announcements (path-based fallback) and withdrawals (peer-ASN fallback).~~
+- ~~`path_coords` stays on `Geo` only — MMDB has no ASN→coord mapping; per-hop coarse coords are acceptable for the path polyline.~~
+- ~~Config: `geoip.city_db` string in `config.yaml`; no env vars. Delivery is the operator's concern (local path in dev, ConfigMap mount in prod). Licensing + redistribution terms keep the MMDB out of the repo.~~
+- ~~BGP worker opens the MMDB once in `commands/worker.go` for the `--type bgp` branch; `defer Close()` on command exit. Other worker types are untouched.~~
+- ~~Tests: `parser_test.go` gains a `fakeCity` fixture and three precedence cases (MMDB wins / MMDB miss → Geo fallback / both miss → drop / withdrawal MMDB precedence). `city_test.go` is env-gated on `FUKAN_TEST_GEOIP_DB` so CI stays green without shipping a 70 MB blob.~~
+
+## Phase 5.2 — BGP Org Enrichment (✅ 2026-04-18)
+
+Detail panel showed `AS15169` as a raw number — users had to run a second lookup to know whose prefix they were looking at. Added prefix-holder org enrichment via MaxMind's GeoLite2-ASN MMDB (separate free file, ~8.5 MB, same `oschwald/geoip2-golang` library):
+
+- ~~`internal/worker/bgp/asn.go` — `ASNLookup` wrapper parallel to `CityLookup`. `LookupPrefix(prefix)` parses CIDR → netIP → `Reader.ASN(ip)` → `(asn, org, ok)`. Zero ASN or empty org returns `ok=false`.~~
+- ~~Two new fields on `BgpEvent`: `PrefixAS` (uint32) and `PrefixOrg` (string). Stamped at parse time on both announcements and withdrawals. A miss leaves zero values; never drops the event.~~
+- ~~Key UX insight: MaxMind is IP-keyed, so on hijacks it returns the *legitimate holder's* AS+org while `OriginAS` (from RIS Live) holds the announcer. The divergence is the OSINT signal — surfaced in `BgpDetailPanel.tsx` with a dedicated red warning strip when `prefix_as !== origin_as` on hijack/leak events.~~
+- ~~Migration 000008 adds `prefix_as UInt32` + `prefix_org LowCardinality(String)` to `bgp_events`. ADD COLUMN is metadata-only in MergeTree; 24 h TTL cycles legacy rows out naturally.~~
+- ~~Config: `geoip.asn_db` alongside `geoip.city_db`. Worker opens both MMDBs at startup, fails fast on either missing. `defer Close()` in command cleanup.~~
+- ~~Schema-drift trio touched: `model.BgpEvent` (Go) + `Bgp::ViewportQuery` SELECT aliases (Rails) + `BgpEvent` TS interface. Schema-drift hazard comments extended on all three. `Bgp::CachedViewportQuery` cache-key prefix bumped to `bgp:v2:` so 3-second caches can't serve stale-shape payloads.~~
+- ~~Tests: `parser_test.go` fakeASN fixture with four cases (stamping hit / miss leaves empty / hijack divergence / withdrawal stamping). `asn_test.go` env-gated on `FUKAN_TEST_GEOIP_ASN_DB`.~~
 
 ## Phase 6 — News Feed (GDELT)
 

@@ -11,6 +11,7 @@ import (
 )
 
 // InsertBatch inserts a batch of FukanEvents into fukan.telemetry_raw using columnar encoding.
+// BGP events do NOT flow through here — see InsertBGPBatch in bgp_insert.go.
 func InsertBatch(ctx context.Context, conn *ch.Client, events []model.FukanEvent) error {
 	if len(events) == 0 {
 		return nil

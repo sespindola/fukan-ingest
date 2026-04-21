@@ -7,6 +7,7 @@ type Config struct {
 	NATS         NATSConfig                     `mapstructure:"nats"`
 	ClickHouse   ClickHouseConfig               `mapstructure:"clickhouse"`
 	Redis        RedisConfig                    `mapstructure:"redis"`
+	GeoIP        GeoIPConfig                    `mapstructure:"geoip"`
 	Integrations map[string][]IntegrationConfig `mapstructure:"integrations"`
 }
 
@@ -23,6 +24,15 @@ type ClickHouseConfig struct {
 
 type RedisConfig struct {
 	URL string `mapstructure:"url"`
+}
+
+// GeoIPConfig points at on-disk MaxMind MMDB files consumed by the BGP
+// worker. CityDB provides prefix → (lat, lon); ASNDB provides prefix →
+// (registered holder ASN, organization name). Paths are local-filesystem
+// only; delivery (mount, copy, refresh) is the operator's responsibility.
+type GeoIPConfig struct {
+	CityDB string `mapstructure:"city_db"`
+	ASNDB  string `mapstructure:"asn_db"`
 }
 
 type IntegrationConfig struct {

@@ -15,6 +15,7 @@ import (
 	"github.com/sespindola/fukan-ingest/internal/worker"
 	"github.com/sespindola/fukan-ingest/internal/worker/adsb"
 	"github.com/sespindola/fukan-ingest/internal/worker/ais"
+	"github.com/sespindola/fukan-ingest/internal/worker/bgp"
 	tleWorker "github.com/sespindola/fukan-ingest/internal/worker/tle"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -30,7 +31,7 @@ func newWorkerCmd() *cobra.Command {
 			return runWorker(cmd.Context(), configFrom(cmd), workerType)
 		},
 	}
-	cmd.Flags().StringVar(&workerType, "type", "", "feed type: adsb, ais, tle")
+	cmd.Flags().StringVar(&workerType, "type", "", "feed type: adsb, ais, tle, bgp")
 	_ = cmd.MarkFlagRequired("type")
 	return cmd
 }
@@ -65,6 +66,29 @@ func runWorker(ctx context.Context, cfg *config.Config, feedType string) error {
 	ctx, cancel := fukanSignal.NotifyCtx(ctx)
 	defer cancel()
 
+	// BGP worker consumes two MaxMind MMDBs: City (prefix → lat/lon) and
+	// ASN (prefix → registered holder ASN + org). Open both once; shared
+	// across integrations (currently just ris-live).
+	var (
+		bgpCity *bgp.CityLookup
+		bgpASN  *bgp.ASNLookup
+	)
+	if feedType == "bgp" {
+		bgpCity, err = bgp.NewCityLookup(cfg.GeoIP.CityDB)
+		if err != nil {
+			return fmt.Errorf("bgp worker: %w", err)
+		}
+		slog.Info("geoip city loaded", "path", cfg.GeoIP.CityDB, "build_epoch", bgpCity.BuildEpoch())
+		defer bgpCity.Close()
+
+		bgpASN, err = bgp.NewASNLookup(cfg.GeoIP.ASNDB)
+		if err != nil {
+			return fmt.Errorf("bgp worker: %w", err)
+		}
+		slog.Info("geoip asn loaded", "path", cfg.GeoIP.ASNDB, "build_epoch", bgpASN.BuildEpoch())
+		defer bgpASN.Close()
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 
 	// TLE workers handle multiple sources internally (CelesTrak + classified).
@@ -77,7 +101,7 @@ func runWorker(ctx context.Context, cfg *config.Config, feedType string) error {
 		})
 	} else {
 		for _, ic := range integrations {
-			w, err := newWorker(feedType, ic, nc)
+			w, err := newWorker(feedType, ic, nc, bgpCity, bgpASN)
 			if err != nil {
 				cancel()
 				return err
@@ -100,7 +124,7 @@ func runWorker(ctx context.Context, cfg *config.Config, feedType string) error {
 	return nil
 }
 
-func newWorker(feedType string, ic config.IntegrationConfig, nc *nats.Conn) (worker.Worker, error) {
+func newWorker(feedType string, ic config.IntegrationConfig, nc *nats.Conn, bgpCity *bgp.CityLookup, bgpASN *bgp.ASNLookup) (worker.Worker, error) {
 	switch feedType {
 	case "adsb":
 		var opts []adsb.Option
@@ -124,6 +148,8 @@ func newWorker(feedType string, ic config.IntegrationConfig, nc *nats.Conn) (wor
 			opts = append(opts, ais.WithAPIKey(ic.APIKey))
 		}
 		return ais.New(ic.APIURL, ic.Name, nc, opts...), nil
+	case "bgp":
+		return bgp.New(ic.APIURL, ic.Name, nc, bgpCity, bgpASN), nil
 	default:
 		return nil, fmt.Errorf("unknown feed type: %s", feedType)
 	}

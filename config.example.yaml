@@ -10,6 +10,15 @@ clickhouse:
 redis:
   url: redis://localhost:6379/0
 
+# MaxMind GeoLite2 databases consumed by the BGP worker. Download both
+# from https://www.maxmind.com (free account required). BGP worker fails
+# to start if either file is missing or unreadable.
+#   city_db → prefix → (lat, lon) at city-level precision
+#   asn_db  → prefix → registered holder ASN + org name (for hijack UX)
+geoip:
+  city_db: /var/lib/geoip/GeoLite2-City.mmdb
+  asn_db:  /var/lib/geoip/GeoLite2-ASN.mmdb
+
 integrations:
   adsb:
     - name: opensky
@@ -35,3 +44,10 @@ integrations:
     - name: classfd
       api_url: https://mmccants.org/tles/classfd.zip
       interval: 21600  # 6 hours
+  bgp:
+    # RIPE NCC RIS Live real-time BGP stream. No API key required.
+    # Worker filters the firehose to high-signal events only:
+    # hijack (origin change), leak (Tier-1 downstream of non-Tier-1),
+    # withdrawal of known prefix, new-prefix announcement.
+    - name: ris-live
+      api_url: wss://ris-live.ripe.net/v1/ws/?client=fukan-ingest

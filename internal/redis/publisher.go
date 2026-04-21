@@ -16,16 +16,20 @@ import (
 // anycable-go's --redis_channel default.
 const anycableBroadcastChannel = "__anycable__"
 
-// broadcastResolutions are the H3 resolutions a single event is broadcast at.
-// Each event fans out to one stream per resolution so the client can subscribe
-// at any altitude band the frontend chooses in types/globe.ts. Covering res 2
-// through 7 means a browser zoomed out to continental view (res 3, ~185 cells
-// over Iberia) and a browser zoomed to ground level (res 7) both receive
-// matching broadcasts without requiring server-side child expansion.
-var broadcastResolutions = []int{2, 3, 4, 5, 6, 7}
+// telemetryResolutions are the H3 resolutions a single telemetry event is
+// broadcast at. Covering res 2 through 7 lets the frontend subscribe at any
+// altitude band without requiring server-side child expansion.
+var telemetryResolutions = []int{2, 3, 4, 5, 6, 7}
 
-// Publisher broadcasts FukanEvents to anycable-go via Redis pub/sub using the
-// AnyCable broadcast envelope: {"stream": "telemetry:<h3_hex>", "data": "<event_json>"}.
+// bgpResolutions broadcasts BGP events at a single coarse resolution. BGP
+// event coordinates are themselves imprecise (geolocated from the origin AS's
+// HQ lat/lon, not actual routing infrastructure), so zoom-band-precise
+// subscriptions would be misleading. The frontend always subscribes at
+// res 3 regardless of camera altitude — see app/frontend/hooks/useAnyCable.ts.
+var bgpResolutions = []int{3}
+
+// Publisher broadcasts events to anycable-go via Redis pub/sub using the
+// AnyCable broadcast envelope: {"stream": "<prefix>:<h3_hex>", "data": "<event_json>"}.
 // H3 cells are encoded in the h3-js canonical hex form (h3-go Cell.String()),
 // which matches what the browser's polygonToCells() returns.
 type Publisher struct {
@@ -49,11 +53,11 @@ func NewPublisher(url string) (*Publisher, error) {
 	return &Publisher{client: redis.NewClient(opts)}, nil
 }
 
-// PublishBatch emits one envelope per (event, resolution) combination in a
-// single Redis pipeline. Intended to be called from a single broadcaster
-// goroutine so Redis sees a small, steady number of pipeline Execs regardless
-// of event rate, avoiding the connection-pool contention that goroutine-per-
-// event publishing causes under burst.
+// PublishBatch emits telemetry envelopes (one per (event, resolution)
+// combination) on the `telemetry:<h3_hex>` stream in a single Redis
+// pipeline. Intended to be called from a single broadcaster goroutine so
+// Redis sees a small, steady number of pipeline Execs regardless of event
+// rate.
 func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent) error {
 	if len(events) == 0 {
 		return nil
@@ -64,30 +68,61 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent)
 		if err != nil {
 			return fmt.Errorf("marshal event %s: %w", e.AssetID, err)
 		}
-		dataStr := string(data)
-
-		cell := h3.Cell(e.H3Cell)
-		for _, res := range broadcastResolutions {
-			streamCell := cell
-			if res != 7 {
-				parent, pErr := cell.Parent(res)
-				if pErr != nil {
-					return fmt.Errorf("h3 parent res %d: %w", res, pErr)
-				}
-				streamCell = parent
-			}
-			envelope, mErr := json.Marshal(anycableEnvelope{
-				Stream: "telemetry:" + streamCell.String(),
-				Data:   dataStr,
-			})
-			if mErr != nil {
-				return fmt.Errorf("marshal envelope res %d: %w", res, mErr)
-			}
-			pipe.Publish(ctx, anycableBroadcastChannel, envelope)
+		if err := queueEnvelopes(ctx, pipe, data, h3.Cell(e.H3Cell), "telemetry:", telemetryResolutions); err != nil {
+			return err
 		}
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("redis publish pipeline: %w", err)
+	}
+	return nil
+}
+
+// PublishBGPBatch emits BGP envelopes on the `bgp:<h3_hex>` stream at a
+// single resolution. Same pipelining semantics as PublishBatch.
+func (p *Publisher) PublishBGPBatch(ctx context.Context, events []model.BgpEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	pipe := p.client.Pipeline()
+	for _, e := range events {
+		data, err := json.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("marshal bgp event %s: %w", e.EventID, err)
+		}
+		if err := queueEnvelopes(ctx, pipe, data, h3.Cell(e.H3Cell), "bgp:", bgpResolutions); err != nil {
+			return err
+		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("redis bgp publish pipeline: %w", err)
+	}
+	return nil
+}
+
+// queueEnvelopes appends one anycable envelope per target resolution to the
+// pipeline. The H3 cell is coarsened to each resolution's parent via h3-go
+// Cell.Parent; resolution 7 is passed through unchanged since all events are
+// computed at that resolution.
+func queueEnvelopes(ctx context.Context, pipe redis.Pipeliner, data []byte, cell h3.Cell, prefix string, resolutions []int) error {
+	dataStr := string(data)
+	for _, res := range resolutions {
+		streamCell := cell
+		if res != 7 {
+			parent, pErr := cell.Parent(res)
+			if pErr != nil {
+				return fmt.Errorf("h3 parent res %d: %w", res, pErr)
+			}
+			streamCell = parent
+		}
+		envelope, mErr := json.Marshal(anycableEnvelope{
+			Stream: prefix + streamCell.String(),
+			Data:   dataStr,
+		})
+		if mErr != nil {
+			return fmt.Errorf("marshal envelope res %d: %w", res, mErr)
+		}
+		pipe.Publish(ctx, anycableBroadcastChannel, envelope)
 	}
 	return nil
 }
