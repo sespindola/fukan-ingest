@@ -54,10 +54,15 @@ func NewPublisher(url string) (*Publisher, error) {
 }
 
 // PublishBatch emits telemetry envelopes (one per (event, resolution)
-// combination) on the `telemetry:<h3_hex>` stream in a single Redis
-// pipeline. Intended to be called from a single broadcaster goroutine so
-// Redis sees a small, steady number of pipeline Execs regardless of event
+// combination) on the `telemetry:<asset_type>:<h3_hex>` stream in a single
+// Redis pipeline. Intended to be called from a single broadcaster goroutine
+// so Redis sees a small, steady number of pipeline Execs regardless of event
 // rate.
+//
+// The asset_type dimension in the stream key lets fukan-web subscribe only
+// to the layer types the user has enabled, so e.g. a satellites-only client
+// doesn't wake up for every aircraft tick. Each event has exactly one
+// asset_type, so this does NOT multiply envelope count — it narrows fan-out.
 func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent) error {
 	if len(events) == 0 {
 		return nil
@@ -68,7 +73,8 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent)
 		if err != nil {
 			return fmt.Errorf("marshal event %s: %w", e.AssetID, err)
 		}
-		if err := queueEnvelopes(ctx, pipe, data, h3.Cell(e.H3Cell), "telemetry:", telemetryResolutions); err != nil {
+		prefix := "telemetry:" + string(e.AssetType) + ":"
+		if err := queueEnvelopes(ctx, pipe, data, h3.Cell(e.H3Cell), prefix, telemetryResolutions); err != nil {
 			return err
 		}
 	}

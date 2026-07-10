@@ -20,7 +20,7 @@ func newRefreshCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "refresh",
 		Short: "Refresh reference data from external sources",
-		Long:  "Refresh reference data from external sources.\n\nValid targets:\n  airlines     Download and import airline/aircraft reference data from OpenSky\n  satellites   Download and import satellite catalog from GCAT (planet4589.org)",
+		Long:  "Refresh reference data from external sources.\n\nValid targets:\n  airlines     Download and import airline/aircraft reference data from OpenSky\n  satellites   Download and import satellite catalog from GCAT (planet4589.org)\n  cables       Download and import submarine cable geometry from OSM/Overpass",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := configFrom(cmd)
 			ctx, cancel := fukanSignal.NotifyCtx(cmd.Context())
@@ -83,12 +83,26 @@ func newRefreshCmd() *cobra.Command {
 
 				return refresh.Satellite(ctx, conn, "", false)
 
+			case "cables":
+				if refreshDryRun {
+					slog.Info("dry-run mode — will parse OSM data but skip ClickHouse writes")
+					return refresh.Cables(ctx, nil, "", true)
+				}
+
+				conn, err := clickhouse.Connect(ctx, cfg.ClickHouse)
+				if err != nil {
+					return err
+				}
+				defer conn.Close()
+
+				return refresh.Cables(ctx, conn, "", false)
+
 			default:
-				return fmt.Errorf("unknown refresh target: %s (supported: airlines, satellites)", refreshTarget)
+				return fmt.Errorf("unknown refresh target: %s (supported: airlines, satellites, cables)", refreshTarget)
 			}
 		},
 	}
-	cmd.Flags().StringVar(&refreshTarget, "target", "", "refresh target: airlines, satellites")
+	cmd.Flags().StringVar(&refreshTarget, "target", "", "refresh target: airlines, satellites, cables")
 	_ = cmd.MarkFlagRequired("target")
 	cmd.Flags().BoolVar(&refreshDryRun, "dry-run", false, "download and parse but skip DB writes")
 	return cmd
