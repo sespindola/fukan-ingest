@@ -23,12 +23,17 @@ func WithClassifiedURL(url string) Option {
 
 const (
 	// Maneuver detection thresholds.
-	maneuverMeanMotionDelta = 0.01  // rev/day — significant orbit change
+	maneuverMeanMotionDelta  = 0.01 // rev/day — significant orbit change
 	maneuverInclinationDelta = 0.1  // degrees — plane change maneuver
 
 	// Decay detection thresholds.
 	decayPerigeeKm = 150.0
 	decayBstar     = 0.01 // high drag term
+
+	// Satellites used to be emitted as one regime-sized burst every 30–120s.
+	// A shared 200ms scheduler spreads each regime over stable NORAD buckets,
+	// preserving the update interval while bounding downstream burst size.
+	propagationTick = 200 * time.Millisecond
 )
 
 // satEntry holds a parsed TLE and its derived metadata.
@@ -94,35 +99,22 @@ func (w *TLEWorker) Run(ctx context.Context) error {
 
 	slog.Info("TLE store populated", "worker", w.Name(), "satellites", len(w.store))
 
-	// Start propagation goroutines.
-	var wg sync.WaitGroup
-	regimes := []struct {
-		name     string
-		interval time.Duration
-	}{
-		{RegimeLEO, 30 * time.Second},
-		{RegimeMEO, 60 * time.Second},
-		{RegimeGEO, 120 * time.Second},
-		{RegimeHEO, 30 * time.Second},
-	}
-
-	for _, r := range regimes {
-		wg.Add(1)
-		go func(regime string, interval time.Duration) {
-			defer wg.Done()
-			w.propagateLoop(ctx, regime, interval)
-		}(r.name, r.interval)
-	}
-
-	// Periodic re-fetch.
+	propagationTicker := time.NewTicker(propagationTick)
+	defer propagationTicker.Stop()
 	fetchTicker := time.NewTicker(w.fetchInterval)
 	defer fetchTicker.Stop()
+	var propagated int64
 
 	for {
 		select {
 		case <-ctx.Done():
-			wg.Wait()
 			return ctx.Err()
+		case now := <-propagationTicker.C:
+			n := w.propagateScheduled(ctx, now.UTC())
+			propagated += int64(n)
+			if propagated > 0 && propagated%10000 < int64(n) {
+				slog.Info("satellite positions propagated", "worker", w.Name(), "total", propagated)
+			}
 		case <-fetchTicker.C:
 			if err := w.fetchAll(ctx); err != nil {
 				slog.Warn("TLE re-fetch failed", "worker", w.Name(), "err", err)
@@ -216,34 +208,11 @@ func (w *TLEWorker) fetchAll(ctx context.Context) error {
 	return nil
 }
 
-func (w *TLEWorker) propagateLoop(ctx context.Context, regime string, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	var count int64
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			n := w.propagateRegime(ctx, regime)
-			count += int64(n)
-			if count > 0 && count%(10000) < int64(n) {
-				slog.Info("satellite positions propagated",
-					"worker", w.Name(), "regime", regime, "total", count)
-			}
-		}
-	}
-}
-
-func (w *TLEWorker) propagateRegime(ctx context.Context, regime string) int {
-	now := time.Now().UTC()
-
+func (w *TLEWorker) propagateScheduled(ctx context.Context, now time.Time) int {
 	w.mu.RLock()
-	entries := make([]*satEntry, 0, len(w.store)/4)
+	entries := make([]*satEntry, 0, len(w.store)/100)
 	for _, e := range w.store {
-		if e.regime == regime {
+		if satelliteDue(e, now) {
 			entries = append(entries, e)
 		}
 	}
@@ -266,6 +235,32 @@ func (w *TLEWorker) propagateRegime(ctx context.Context, regime string) int {
 		published++
 	}
 	return published
+}
+
+func satelliteDue(entry *satEntry, now time.Time) bool {
+	interval := propagationInterval(entry.regime)
+	if interval == 0 {
+		return false
+	}
+	slots := uint64(interval / propagationTick)
+	absoluteSlot := uint64(now.UnixMilli() / propagationTick.Milliseconds())
+	// Multiplicative hashing avoids visible clumps when catalog numbers are
+	// sequential while remaining stable across restarts and catalog refreshes.
+	bucket := (uint64(entry.noradID) * 11400714819323198485) % slots
+	return absoluteSlot%slots == bucket
+}
+
+func propagationInterval(regime string) time.Duration {
+	switch regime {
+	case RegimeLEO, RegimeHEO:
+		return 30 * time.Second
+	case RegimeMEO:
+		return 60 * time.Second
+	case RegimeGEO:
+		return 120 * time.Second
+	default:
+		return 0
+	}
 }
 
 func propagateOne(e *satEntry, now time.Time) (model.FukanEvent, bool) {

@@ -28,7 +28,7 @@ Two parallel pipelines share the same infrastructure (NATS, ClickHouse, Redis) b
     ┌──────────────────────┐  ┌──────────────────────┐
     │ Batcher (telemetry)  │  │ BGPBatcher           │
     │ CH  : 10k or 2s      │  │ CH  : 10k or 2s      │
-    │ Pub : 500 or 50 ms   │  │ Pub : 500 or 50 ms   │
+    │ Pub : 5k or 200 ms   │  │ Pub : 500 or 50 ms   │
     └────┬───────────┬─────┘  └────┬───────────┬─────┘
          │           │             │           │
          ▼           ▼             ▼           ▼
@@ -205,7 +205,7 @@ Callers use `*nats.Conn` directly for `QueueSubscribe`, `Drain`, `Close`.
 
 Two parallel types — `Batcher` (telemetry, `FukanEvent`) and `BGPBatcher` (BGP, `BgpEvent`) — that share the same shape but call different ClickHouse insert and Redis publish methods. Kept as parallel structs rather than a Go generic because the ClickHouse insert calls need type-specific column lists and generics over different insert signatures would add more noise than it removes.
 
-Each type exposes a single `HandleMsg(*nats.Msg)` entry point. Incoming events are (1) validated, (2) enqueued on a bounded broadcast channel for live streaming, and (3) appended to the ClickHouse buffer for persistence. The two paths are decoupled so live subscribers see updates within ~50 ms regardless of the ClickHouse buffer state, and neither path spawns a goroutine per event.
+Each type exposes a single `HandleMsg(*nats.Msg)` entry point. Incoming events are (1) validated, (2) enqueued on a bounded broadcast channel for live streaming, and (3) appended to the ClickHouse buffer for persistence. The two paths are decoupled, so ClickHouse latency does not block live delivery and neither path spawns a goroutine per event.
 
 **ClickHouse path** (dual-threshold flush):
 - **Size threshold:** 10,000 events triggers immediate flush.
@@ -215,8 +215,8 @@ Each type exposes a single `HandleMsg(*nats.Msg)` entry point. Incoming events a
 
 **Broadcast path** (dedicated `broadcastLoop()` goroutine spawned in `New()` / `NewBGP()`):
 - **Channel:** bounded at 50,000 events. On overflow the event is dropped with a warning — broadcasts are non-critical and ClickHouse is the source of truth.
-- **Size threshold:** 500 events coalesced into a single Redis pipeline `Exec`.
-- **Time threshold:** 50 ms ticker flushes any pending events.
+- **Telemetry:** 200 ms last-value-wins window, capped at 5,000 unique assets. Raw ClickHouse events are unaffected.
+- **BGP:** 500 events or 50 ms; BGP happenings are discrete and are never coalesced by asset id.
 - **Timeout:** Each pipeline `Exec` is bounded by a 5 s context.
 - Only one `Exec` is in flight at a time per batcher (single broadcaster), so the Redis connection pool sees a small, steady workload under burst.
 - Telemetry batcher calls `redis.PublishBatch` (`telemetry:<h3>`, res 2–7); BGP batcher calls `redis.PublishBGPBatch` (`bgp:<h3>`, res 3 only — see `internal/redis`).
@@ -232,12 +232,12 @@ Free functions — no wrapper types:
 
 ### `internal/redis`
 
-`Publisher` broadcasts to anycable-go via the Redis pub/sub channel `__anycable__` (the anycable-go default for `broadcast_adapters = ["redis"]`). Each event is wrapped in an `anycableEnvelope` of shape `{"stream": "<prefix>:<h3_hex>", "data": "<event_json>"}` and fanned out across one or more H3 resolutions. The cell id is encoded via h3-go's `Cell.String()` so it matches what the browser's `polygonToCells()` / `cellToParent()` (h3-js) return.
+`Publisher` broadcasts to anycable-go via the Redis pub/sub channel `__anycable__`. Telemetry events are grouped by exact type/H3 stream into bounded `delta_batch` payloads (128 events or 48 KiB), and publication envelopes are bundled into Redis messages capped at 256 KiB. H3 values are hexadecimal strings on the browser wire while NATS and ClickHouse retain UInt64.
 
 - `PublishBatch(ctx, events []FukanEvent) error` — stream prefix `telemetry:`, fan-out across H3 resolutions **2–7**. The frontend subscribes at its current altitude band without server-side child expansion.
 - `PublishBGPBatch(ctx, events []BgpEvent) error` — stream prefix `bgp:`, fan-out at **res 3 only**. BGP event coordinates are imprecise (geolocated from the origin AS's HQ lat/lon, not actual routing infrastructure), so zoom-band-precise subscriptions would be misleading. The frontend always subscribes at res 3 (`cellToParent(cell, 3)` on the viewport cells) regardless of camera altitude. This cuts per-event Redis `PUBLISH` calls 6×.
 
-Both methods coalesce a whole batch into one pipeline `Exec` and are called exclusively from their respective `broadcastLoop()` goroutines (single broadcaster per batcher).
+Both methods are called exclusively from their respective `broadcastLoop()` goroutines. Set `FUKAN_LIVE_BATCHES=false` only for emergency rollback to legacy one-event telemetry publications.
 
 ### `internal/signal`
 
@@ -261,7 +261,7 @@ Both methods coalesce a whole batch into one pipeline `Exec` and are called excl
 
 ### `internal/worker/tle`
 
-- Single `TLEWorker` manages fetching (CelesTrak 2 h, classified TLEs 6 h) and continuous SGP4 propagation in four parallel goroutines — one per orbit regime (LEO 30 s, MEO 60 s, GEO 120 s, HEO 30 s).
+- Single `TLEWorker` manages fetching (CelesTrak 2 h, classified TLEs 6 h) and SGP4 propagation. A 200 ms stable NORAD-bucket scheduler spreads each regime across its interval instead of emitting synchronized 30/60/120-second bursts.
 - `Confidence` tag: `official` (CelesTrak), `community_derived` (classified), `stale` (TLE epoch > 14 d LEO/HEO, 30 d MEO/GEO).
 - `SatStatus` tag: `maneuvering` on mean-motion (> 0.01 rev/day) or inclination (> 0.1°) delta between fetches; `decaying` on perigee < 150 km or BSTAR > 0.01.
 
@@ -307,7 +307,7 @@ Typed configuration structs with `mapstructure` tags for Viper unmarshalling:
 | Load distribution | NATS queue groups: `batcher-{asset_type}` for telemetry, `batcher-bgp` for BGP. |
 | Backpressure | None from broker; batcher flush controls local memory. |
 | CH failure behavior | Retry with exponential backoff (100ms→5s, 5 attempts, 10 concurrent cap). |
-| Live broadcast latency | ≤50 ms from NATS arrival to Redis publish, independent of ClickHouse buffer state. |
+| Live broadcast latency | ≤200 ms coalescing target from NATS arrival to Redis publish, independent of ClickHouse buffer state. |
 | Broadcast overflow | 50k-event bounded channel per batcher; on overflow events are dropped with a warning (ClickHouse path unaffected). |
 | Shutdown behavior | Batchers `DrainAndFlush()`: CH flush → CH retry drain → broadcast channel close → broadcast drain. NATS `Drain()` to flush pending. |
 

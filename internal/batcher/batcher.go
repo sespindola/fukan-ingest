@@ -31,13 +31,13 @@ const (
 	// Sized to absorb a multi-second burst at the projected aggregate event rate
 	// (aircraft + AIS + BGP + ...). On overflow events are dropped with a warning.
 	broadcastBufferSize = 50_000
-	// broadcastBatchSize is the max number of events coalesced into a single
-	// Redis pipeline Exec.
-	broadcastBatchSize = 500
-	// broadcastFlushInterval bounds the broadcaster's latency when events
-	// arrive slowly. At 500 events/s the size threshold hits first; at idle
-	// any pending event is still flushed within this window.
-	broadcastFlushInterval = 50 * time.Millisecond
+	// The live path is last-value-wins: raw events still persist to ClickHouse,
+	// while Redis receives at most one position per asset in this window.
+	broadcastBatchSize     = 5_000
+	broadcastFlushInterval = 200 * time.Millisecond
+	// BGP events are discrete happenings and must not be coalesced by asset id.
+	bgpBroadcastBatchSize     = 500
+	bgpBroadcastFlushInterval = 50 * time.Millisecond
 	// broadcastPublishTimeout bounds a single Redis pipeline Exec. Generous
 	// because only one Exec is in flight at a time (single broadcaster).
 	broadcastPublishTimeout = 5 * time.Second
@@ -110,28 +110,35 @@ func (b *Batcher) HandleMsg(msg *nats.Msg) {
 	}
 }
 
-// broadcastLoop is the sole consumer of broadcastCh. It accumulates events
-// and flushes them to Redis either when broadcastBatchSize is reached or
-// broadcastFlushInterval elapses with a non-empty batch. Runs until
-// broadcastCh is closed by DrainAndFlush, at which point it flushes any
-// remainder and signals broadcastDone.
+// broadcastLoop is the sole consumer of broadcastCh. Within each 200 ms
+// window it keeps only the newest position per (asset_type, asset_id), then
+// hands the unique events to the Redis publisher for H3 grouping and framing.
 func (b *Batcher) broadcastLoop() {
 	defer close(b.broadcastDone)
 
-	batch := make([]model.FukanEvent, 0, broadcastBatchSize)
+	pending := make(map[string]model.FukanEvent, broadcastBatchSize)
 	ticker := time.NewTicker(broadcastFlushInterval)
 	defer ticker.Stop()
+	statsTicker := time.NewTicker(10 * time.Second)
+	defer statsTicker.Stop()
+	var receivedWindow, publishedWindow int
 
 	flush := func() {
-		if len(batch) == 0 {
+		if len(pending) == 0 {
 			return
 		}
+		batch := make([]model.FukanEvent, 0, len(pending))
+		for _, event := range pending {
+			batch = append(batch, event)
+		}
+		pending = make(map[string]model.FukanEvent, broadcastBatchSize)
+		publishedWindow += len(batch)
+
 		ctx, cancel := context.WithTimeout(context.Background(), broadcastPublishTimeout)
 		if err := b.redis.PublishBatch(ctx, batch); err != nil {
 			slog.Warn("broadcast publish failed", "err", err, "count", len(batch))
 		}
 		cancel()
-		batch = batch[:0]
 	}
 
 	for {
@@ -141,13 +148,30 @@ func (b *Batcher) broadcastLoop() {
 				flush()
 				return
 			}
-			batch = append(batch, e)
-			if len(batch) >= broadcastBatchSize {
+			receivedWindow++
+			upsertLatest(pending, e)
+			if len(pending) >= broadcastBatchSize {
 				flush()
 			}
 		case <-ticker.C:
 			flush()
+		case <-statsTicker.C:
+			flush()
+			slog.Info("live broadcast window",
+				"received", receivedWindow,
+				"published_unique", publishedWindow,
+				"coalesced", max(0, receivedWindow-publishedWindow),
+				"pending", len(pending))
+			receivedWindow = 0
+			publishedWindow = 0
 		}
+	}
+}
+
+func upsertLatest(pending map[string]model.FukanEvent, event model.FukanEvent) {
+	key := string(event.AssetType) + "\x00" + event.AssetID
+	if previous, exists := pending[key]; !exists || event.Timestamp >= previous.Timestamp {
+		pending[key] = event
 	}
 }
 

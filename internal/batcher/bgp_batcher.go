@@ -85,8 +85,8 @@ func (b *BGPBatcher) HandleMsg(msg *nats.Msg) {
 func (b *BGPBatcher) broadcastLoop() {
 	defer close(b.broadcastDone)
 
-	batch := make([]model.BgpEvent, 0, broadcastBatchSize)
-	ticker := time.NewTicker(broadcastFlushInterval)
+	batch := make([]model.BgpEvent, 0, bgpBroadcastBatchSize)
+	ticker := time.NewTicker(bgpBroadcastFlushInterval)
 	defer ticker.Stop()
 
 	flush := func() {
@@ -109,7 +109,7 @@ func (b *BGPBatcher) broadcastLoop() {
 				return
 			}
 			batch = append(batch, e)
-			if len(batch) >= broadcastBatchSize {
+			if len(batch) >= bgpBroadcastBatchSize {
 				flush()
 			}
 		case <-ticker.C:

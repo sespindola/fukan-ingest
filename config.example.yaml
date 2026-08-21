@@ -10,6 +10,9 @@ clickhouse:
 redis:
   url: redis://localhost:6379/0
 
+# Emergency rollback only: set FUKAN_LIVE_BATCHES=false to restore legacy
+# one-event AnyCable publications while keeping safe hexadecimal H3 payloads.
+
 # MaxMind GeoLite2 databases consumed by the BGP worker. Download both
 # from https://www.maxmind.com (free account required). BGP worker fails
 # to start if either file is missing or unreadable.

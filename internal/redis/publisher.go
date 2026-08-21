@@ -4,79 +4,283 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"sort"
+	"time"
 
-	"github.com/redis/go-redis/v9"
+	redisclient "github.com/redis/go-redis/v9"
 	"github.com/uber/h3-go/v4"
 
 	"github.com/sespindola/fukan-ingest/internal/model"
 )
 
-// anycableBroadcastChannel is the Redis pub/sub channel anycable-go subscribes
-// to when configured with `broadcast_adapters = ["redis"]`. It matches
-// anycable-go's --redis_channel default.
 const anycableBroadcastChannel = "__anycable__"
 
-// telemetryResolutions are the H3 resolutions a single telemetry event is
-// broadcast at. Covering res 2 through 7 lets the frontend subscribe at any
-// altitude band without requiring server-side child expansion.
 var telemetryResolutions = []int{2, 3, 4, 5, 6, 7}
-
-// bgpResolutions broadcasts BGP events at a single coarse resolution. BGP
-// event coordinates are themselves imprecise (geolocated from the origin AS's
-// HQ lat/lon, not actual routing infrastructure), so zoom-band-precise
-// subscriptions would be misleading. The frontend always subscribes at
-// res 3 regardless of camera altitude — see app/frontend/hooks/useAnyCable.ts.
 var bgpResolutions = []int{3}
 
-// Publisher broadcasts events to anycable-go via Redis pub/sub using the
-// AnyCable broadcast envelope: {"stream": "<prefix>:<h3_hex>", "data": "<event_json>"}.
-// H3 cells are encoded in the h3-js canonical hex form (h3-go Cell.String()),
-// which matches what the browser's polygonToCells() returns.
+const (
+	liveWireVersion           = 1
+	maxEventsPerStreamBatch   = 128
+	maxStreamBatchBytes       = 48 * 1024
+	maxPublicationBundleBytes = 256 * 1024
+)
+
 type Publisher struct {
-	client *redis.Client
+	client *redisclient.Client
 }
 
-// anycableEnvelope is the wire format anycable-go expects on the broadcast
-// channel. `data` is a JSON-encoded string that is passed through to the
-// client's ActionCable subscription `received` callback.
 type anycableEnvelope struct {
 	Stream string `json:"stream"`
 	Data   string `json:"data"`
 }
 
-// NewPublisher creates a Redis publisher from a URL (e.g. "redis://localhost:6379/0").
+// wireFukanEvent keeps the internal/NATS H3 representation as UInt64 while
+// emitting the canonical H3 hexadecimal string expected by h3-js. The
+// explicit H3 field shadows the embedded struct's json:"h3" field.
+type wireFukanEvent struct {
+	model.FukanEvent
+	H3 string `json:"h3"`
+}
+
+type wireBgpEvent struct {
+	model.BgpEvent
+	H3 string `json:"h3"`
+}
+
+type liveDeltaBatch struct {
+	Type   string            `json:"type"`
+	V      int               `json:"v"`
+	SentAt int64             `json:"sent_at"`
+	Events []json.RawMessage `json:"events"`
+}
+
 func NewPublisher(url string) (*Publisher, error) {
-	opts, err := redis.ParseURL(url)
+	opts, err := redisclient.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("redis parse url: %w", err)
 	}
-	return &Publisher{client: redis.NewClient(opts)}, nil
+	return &Publisher{client: redisclient.NewClient(opts)}, nil
 }
 
-// PublishBatch emits telemetry envelopes (one per (event, resolution)
-// combination) on the `telemetry:<asset_type>:<h3_hex>` stream in a single
-// Redis pipeline. Intended to be called from a single broadcaster goroutine
-// so Redis sees a small, steady number of pipeline Execs regardless of event
-// rate.
-//
-// The asset_type dimension in the stream key lets fukan-web subscribe only
-// to the layer types the user has enabled, so e.g. a satellites-only client
-// doesn't wake up for every aircraft tick. Each event has exactly one
-// asset_type, so this does NOT multiply envelope count — it narrows fan-out.
+// PublishBatch coalesces transport overhead by emitting bounded arrays of the
+// newest events grouped by exact AnyCable stream. Multiple publications are
+// themselves bundled into one Redis PUBLISH payload. AnyCable still performs
+// normal stream routing, but clients receive one delta batch per matching H3
+// stream instead of one WebSocket frame per asset.
 func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
-	pipe := p.client.Pipeline()
-	for _, e := range events {
-		data, err := json.Marshal(e)
+
+	var (
+		envelopes []anycableEnvelope
+		err       error
+	)
+	if os.Getenv("FUKAN_LIVE_BATCHES") == "false" {
+		envelopes, err = buildLegacyTelemetryEnvelopes(events)
+	} else {
+		envelopes, err = buildTelemetryEnvelopes(events, time.Now().UnixMilli())
+	}
+	if err != nil {
+		return err
+	}
+	return p.publishEnvelopeBundles(ctx, envelopes)
+}
+
+func buildLegacyTelemetryEnvelopes(events []model.FukanEvent) ([]anycableEnvelope, error) {
+	envelopes := make([]anycableEnvelope, 0, len(events)*len(telemetryResolutions))
+	for _, event := range events {
+		wire, err := json.Marshal(wireFukanEvent{
+			FukanEvent: event,
+			H3:         h3.Cell(event.H3Cell).String(),
+		})
 		if err != nil {
-			return fmt.Errorf("marshal event %s: %w", e.AssetID, err)
+			return nil, fmt.Errorf("marshal event %s: %w", event.AssetID, err)
 		}
-		prefix := "telemetry:" + string(e.AssetType) + ":"
-		if err := queueEnvelopes(ctx, pipe, data, h3.Cell(e.H3Cell), prefix, telemetryResolutions); err != nil {
+		cell := h3.Cell(event.H3Cell)
+		for _, resolution := range telemetryResolutions {
+			streamCell := cell
+			if resolution != 7 {
+				parent, err := cell.Parent(resolution)
+				if err != nil {
+					return nil, fmt.Errorf("h3 parent res %d: %w", resolution, err)
+				}
+				streamCell = parent
+			}
+			envelopes = append(envelopes, anycableEnvelope{
+				Stream: "telemetry:" + string(event.AssetType) + ":" + streamCell.String(),
+				Data:   string(wire),
+			})
+		}
+	}
+	return envelopes, nil
+}
+
+func buildTelemetryEnvelopes(events []model.FukanEvent, sentAt int64) ([]anycableEnvelope, error) {
+	groups := make(map[string][]json.RawMessage)
+
+	for _, event := range events {
+		wire, err := json.Marshal(wireFukanEvent{
+			FukanEvent: event,
+			H3:         h3.Cell(event.H3Cell).String(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal event %s: %w", event.AssetID, err)
+		}
+
+		cell := h3.Cell(event.H3Cell)
+		prefix := "telemetry:" + string(event.AssetType) + ":"
+		for _, resolution := range telemetryResolutions {
+			streamCell := cell
+			if resolution != 7 {
+				parent, err := cell.Parent(resolution)
+				if err != nil {
+					return nil, fmt.Errorf("h3 parent res %d: %w", resolution, err)
+				}
+				streamCell = parent
+			}
+			stream := prefix + streamCell.String()
+			groups[stream] = append(groups[stream], json.RawMessage(wire))
+		}
+	}
+
+	streams := make([]string, 0, len(groups))
+	for stream := range groups {
+		streams = append(streams, stream)
+	}
+	sort.Strings(streams)
+
+	envelopes := make([]anycableEnvelope, 0, len(streams))
+	for _, stream := range streams {
+		chunks, err := chunkLiveEvents(groups[stream], sentAt)
+		if err != nil {
+			return nil, fmt.Errorf("build stream batch %s: %w", stream, err)
+		}
+		for _, payload := range chunks {
+			envelopes = append(envelopes, anycableEnvelope{Stream: stream, Data: string(payload)})
+		}
+	}
+	return envelopes, nil
+}
+
+func chunkLiveEvents(events []json.RawMessage, sentAt int64) ([][]byte, error) {
+	var chunks [][]byte
+	current := make([]json.RawMessage, 0, min(len(events), maxEventsPerStreamBatch))
+	emptyPayload, err := json.Marshal(liveDeltaBatch{
+		Type: "delta_batch", V: liveWireVersion, SentAt: sentAt, Events: []json.RawMessage{},
+	})
+	if err != nil {
+		return nil, err
+	}
+	currentBytes := len(emptyPayload)
+
+	flush := func() error {
+		if len(current) == 0 {
+			return nil
+		}
+		payload, err := json.Marshal(liveDeltaBatch{
+			Type:   "delta_batch",
+			V:      liveWireVersion,
+			SentAt: sentAt,
+			Events: current,
+		})
+		if err != nil {
 			return err
 		}
+		chunks = append(chunks, payload)
+		current = make([]json.RawMessage, 0, maxEventsPerStreamBatch)
+		currentBytes = len(emptyPayload)
+		return nil
+	}
+
+	for _, event := range events {
+		additionalBytes := len(event)
+		if len(current) > 0 {
+			additionalBytes++ // comma between array elements
+		}
+		if len(current) > 0 && (len(current) >= maxEventsPerStreamBatch || currentBytes+additionalBytes > maxStreamBatchBytes) {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			additionalBytes = len(event)
+		}
+		current = append(current, event)
+		currentBytes += additionalBytes
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
+
+func (p *Publisher) PublishBGPBatch(ctx context.Context, events []model.BgpEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	envelopes := make([]anycableEnvelope, 0, len(events))
+	for _, event := range events {
+		data, err := json.Marshal(wireBgpEvent{
+			BgpEvent: event,
+			H3:       h3.Cell(event.H3Cell).String(),
+		})
+		if err != nil {
+			return fmt.Errorf("marshal bgp event %s: %w", event.EventID, err)
+		}
+		cell := h3.Cell(event.H3Cell)
+		for _, resolution := range bgpResolutions {
+			parent, err := cell.Parent(resolution)
+			if err != nil {
+				return fmt.Errorf("h3 parent res %d: %w", resolution, err)
+			}
+			envelopes = append(envelopes, anycableEnvelope{
+				Stream: "bgp:" + parent.String(),
+				Data:   string(data),
+			})
+		}
+	}
+	return p.publishEnvelopeBundles(ctx, envelopes)
+}
+
+func (p *Publisher) publishEnvelopeBundles(ctx context.Context, envelopes []anycableEnvelope) error {
+	pipe := p.client.Pipeline()
+	bundle := make([]json.RawMessage, 0, len(envelopes))
+	bundleBytes := 2
+
+	flush := func() error {
+		if len(bundle) == 0 {
+			return nil
+		}
+		payload, err := json.Marshal(bundle)
+		if err != nil {
+			return fmt.Errorf("marshal publication bundle: %w", err)
+		}
+		pipe.Publish(ctx, anycableBroadcastChannel, payload)
+		bundle = bundle[:0]
+		bundleBytes = 2
+		return nil
+	}
+
+	for _, envelope := range envelopes {
+		raw, err := json.Marshal(envelope)
+		if err != nil {
+			return fmt.Errorf("marshal envelope: %w", err)
+		}
+		additional := len(raw)
+		if len(bundle) > 0 {
+			additional++
+		}
+		if len(bundle) > 0 && bundleBytes+additional > maxPublicationBundleBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		bundle = append(bundle, json.RawMessage(raw))
+		bundleBytes += additional
+	}
+	if err := flush(); err != nil {
+		return err
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("redis publish pipeline: %w", err)
@@ -84,56 +288,6 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []model.FukanEvent)
 	return nil
 }
 
-// PublishBGPBatch emits BGP envelopes on the `bgp:<h3_hex>` stream at a
-// single resolution. Same pipelining semantics as PublishBatch.
-func (p *Publisher) PublishBGPBatch(ctx context.Context, events []model.BgpEvent) error {
-	if len(events) == 0 {
-		return nil
-	}
-	pipe := p.client.Pipeline()
-	for _, e := range events {
-		data, err := json.Marshal(e)
-		if err != nil {
-			return fmt.Errorf("marshal bgp event %s: %w", e.EventID, err)
-		}
-		if err := queueEnvelopes(ctx, pipe, data, h3.Cell(e.H3Cell), "bgp:", bgpResolutions); err != nil {
-			return err
-		}
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("redis bgp publish pipeline: %w", err)
-	}
-	return nil
-}
-
-// queueEnvelopes appends one anycable envelope per target resolution to the
-// pipeline. The H3 cell is coarsened to each resolution's parent via h3-go
-// Cell.Parent; resolution 7 is passed through unchanged since all events are
-// computed at that resolution.
-func queueEnvelopes(ctx context.Context, pipe redis.Pipeliner, data []byte, cell h3.Cell, prefix string, resolutions []int) error {
-	dataStr := string(data)
-	for _, res := range resolutions {
-		streamCell := cell
-		if res != 7 {
-			parent, pErr := cell.Parent(res)
-			if pErr != nil {
-				return fmt.Errorf("h3 parent res %d: %w", res, pErr)
-			}
-			streamCell = parent
-		}
-		envelope, mErr := json.Marshal(anycableEnvelope{
-			Stream: prefix + streamCell.String(),
-			Data:   dataStr,
-		})
-		if mErr != nil {
-			return fmt.Errorf("marshal envelope res %d: %w", res, mErr)
-		}
-		pipe.Publish(ctx, anycableBroadcastChannel, envelope)
-	}
-	return nil
-}
-
-// Close closes the Redis connection.
 func (p *Publisher) Close() error {
 	return p.client.Close()
 }

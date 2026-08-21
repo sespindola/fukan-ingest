@@ -4,9 +4,24 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/akhenakh/sgp4"
 )
+
+func TestSatelliteDueExactlyOncePerInterval(t *testing.T) {
+	entry := &satEntry{noradID: 25544, regime: RegimeLEO}
+	start := time.Unix(0, 0).UTC()
+	var due int
+	for offset := time.Duration(0); offset < 30*time.Second; offset += propagationTick {
+		if satelliteDue(entry, start.Add(offset)) {
+			due++
+		}
+	}
+	if due != 1 {
+		t.Fatalf("satellite due %d times, want exactly once", due)
+	}
+}
 
 func loadGPFixture(t *testing.T) []sgp4.OMM {
 	t.Helper()
